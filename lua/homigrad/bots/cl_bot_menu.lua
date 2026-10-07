@@ -4,7 +4,9 @@
 	Two ways in, both showing the same pages:
 	- C menu: the "Tarkov AI Bots" icon among the context-menu windows;
 	- Q menu: Utilities -> Tarkov AI, one page per group.
-	Plus the client command hg_bot_menu, and right-click entries on a bot.
+	Plus the client command hg_bot_menu (or !bots in chat - the Z-City
+	gamemode has no C/Q menu at all), and right-click entries on a bot
+	(hg_bot_menu_target opens the same thing for the bot in the crosshair).
 
 	The window is its own dark panel with a category list down the left,
 	a search box that looks through every parameter at once, and a gear
@@ -88,6 +90,7 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 	-- Saved gear presets and the server's gear catalogue.
 	local kits = {}
 	local catalog = {}
+	local banned = {} -- [class or armour name] = true: off for random kits
 	local incoming -- the last kit the server sent back, for the builder
 
 	net.Receive(hg.bots.NetKits, function()
@@ -100,6 +103,12 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 		kits = istable(payload.names) and payload.names or kits
 
 		if istable(payload.catalog) then catalog = payload.catalog end
+
+		if istable(payload.blacklist) then
+			banned = {}
+
+			for _, name in pairs(payload.blacklist) do banned[tostring(name)] = true end
+		end
 
 		if istable(payload.kit) then
 			incoming = { name = payload.kitName or "", kit = payload.kit }
@@ -431,6 +440,8 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 		Button(panel, L("act.spawn_guard"), dark, function() Act("spawn_guard") end)
 		Button(panel, L("act.removeall"), dark, function() Act("removeall") end)
 
+		Button(panel, L("act.cleanup_now"), dark, function() Act("cleanup_now") end)
+
 		Button(panel, L("act.director_place"), dark, function() Act("director_place") end)
 		Button(panel, L("act.director_status"), dark, function() Act("director_status") end)
 		Button(panel, L("act.director_clear"), dark, function() Act("director_clear") end)
@@ -761,6 +772,125 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 	end
 --//
 
+--\\ Random kit items
+	--[[
+		One tick box per weapon and armour piece the server has: unticked
+		ones never turn up in a random kit (the menu's random spawn,
+		hg_bot_kit_random, a rolled kit in the builder, the AI director).
+		Hand-built kits are not affected. Pluviska and the Fury syringes
+		aren't listed - bots never get those at all.
+	]]
+	local function BuildBlacklist(panel)
+		local help = vgui.Create("DLabel", panel)
+
+		help:SetText(L("ban.help"))
+		help:SetWrap(true)
+		help:SetAutoStretchVertical(true)
+		help:Dock(TOP)
+		help:DockMargin(6, 6, 6, 6)
+
+		Paint(help, true)
+
+		local filter = vgui.Create("DTextEntry", panel)
+
+		filter:Dock(TOP)
+		filter:DockMargin(4, 0, 4, 6)
+		filter:SetPlaceholderText(L("ban.filter"))
+		filter:SetUpdateOnType(true)
+
+		local rows = {}
+		local built = false
+
+		local function applyFilter()
+			local q = string.lower(string.Trim(filter:GetValue() or ""))
+
+			for _, row in ipairs(rows) do
+				if IsValid(row) then
+					row:SetVisible(row.IsHeader or q == "" or string.find(row.Search, q, 1, true) ~= nil)
+				end
+			end
+
+			if panel.GetCanvas then panel:GetCanvas():InvalidateLayout() end
+
+			panel:InvalidateLayout()
+		end
+
+		filter.OnValueChange = applyFilter
+
+		local function build()
+			if built or not next(catalog) then return end
+
+			built = true
+
+			for _, id in ipairs({ "pistol", "light", "heavy", "melee", "grenade", "med", "armor" }) do
+				local list = catalog[id]
+
+				if istable(list) and #list > 0 then
+					local header = vgui.Create("DLabel", panel)
+
+					header:SetText(L("cat." .. id))
+					header:SetFont("DermaDefaultBold")
+					header:Dock(TOP)
+					header:DockMargin(6, 10, 6, 2)
+					header.IsHeader = true
+
+					Paint(header, true)
+
+					rows[#rows + 1] = header
+
+					for _, item in ipairs(list) do
+						local class = tostring(item.class)
+						local box = vgui.Create("DCheckBoxLabel", panel)
+
+						box:SetText(tostring(item.name) .. (item.slot and ("  [" .. tostring(item.slot) .. "]") or ""))
+						box:SetTooltip(class)
+						box:Dock(TOP)
+						box:DockMargin(14, 1, 6, 1)
+						box.Class = class
+						box.Search = string.lower(class .. " " .. tostring(item.name))
+
+						Paint(box, true)
+
+						box.Updating = true
+						box:SetValue(not banned[class])
+						box.Updating = nil
+
+						box.OnChange = function(self, val)
+							if self.Updating then return end
+
+							banned[class] = (not val) or nil
+
+							Act("kit_ban", nil, util.TableToJSON({ name = class, off = not val }))
+						end
+
+						rows[#rows + 1] = box
+					end
+				end
+			end
+
+			applyFilter()
+		end
+
+		local function refresh()
+			build()
+
+			for _, row in ipairs(rows) do
+				if IsValid(row) and row.Class then
+					row.Updating = true
+					row:SetValue(not banned[row.Class])
+					row.Updating = nil
+					row:SetEnabled(isAdmin)
+				end
+			end
+		end
+
+		listeners[panel] = refresh
+
+		refresh()
+		RequestValues()
+	end
+--//
+
 --\\ The window (C menu icon / hg_bot_menu)
 	function hg.bots.OpenMenu()
 		if IsValid(hg.bots.MenuFrame) then hg.bots.MenuFrame:Remove() end
@@ -873,6 +1003,8 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 			BuildBuilder(page)
 		end
 
+		NavButton(L("ban.title"), function(p) BuildBlacklist(p) end)
+
 		for _, group in ipairs(hg.bots.SettingGroups or {}) do
 			NavButton(L("group." .. group.id), function(p) BuildGroup(p, group.id, true) end)
 		end
@@ -887,12 +1019,39 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 	concommand.Add("hg_bot_menu", function() hg.bots.OpenMenu() end)
 
 	-- C menu: the icon row along the bottom of the context menu.
+	--
+	-- Sandbox makes a window for every icon BEFORE calling init
+	-- (contextmenu.lua: Window:SetSize(newv.width, newv.height)), and
+	-- without width/height that SetSize errored out - the click did
+	-- nothing at all, which is the "C menu doesn't open" report. The
+	-- empty window it makes is thrown away (Z-City's own player model
+	-- icon does the same) and the real one opens on its own, so it stays
+	-- up after C is let go.
 	list.Set("DesktopWindows", "HGBotSettings", {
 		title = "Tarkov AI Bots", -- fixed: the menu list is built at load time
-
 		icon = "icon64/settings.png",
-		init = function(icon, window) hg.bots.OpenMenu() end,
+		width = 900,
+		height = 660,
+		onewindow = true,
+		init = function(icon, window)
+			if IsValid(window) then window:Remove() end
+
+			hg.bots.OpenMenu()
+		end,
 	})
+
+	-- The Z-City gamemode itself (base, not sandbox) has no C or Q menu,
+	-- so there the chat is the way in.
+	local CHAT_OPEN = { ["!bots"] = true, ["/bots"] = true, ["!botmenu"] = true, ["/botmenu"] = true }
+
+	hook.Add("OnPlayerChat", "HG_Bots_ChatMenu", function(ply, text)
+		if ply ~= LocalPlayer() or not isstring(text) then return end
+		if not CHAT_OPEN[string.lower(string.Trim(text))] then return end
+
+		hg.bots.OpenMenu()
+
+		return true
+	end)
 --//
 
 --\\ Q menu: Utilities -> Tarkov AI
@@ -940,12 +1099,35 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 
 	-- The server-side IsHomigradBot flag isn't visible here, so bots carry
 	-- a networked marker (set in hg.bots.Init).
-	local function IsBotEnt(ent)
-		return IsValid(ent) and ent:IsPlayer() and ent:GetNWBool("hg_bot", false)
+	--
+	-- A downed bot is a Z-City ragdoll: the right click lands on the
+	-- prop_ragdoll, not on the player, and the entry used to simply not
+	-- show up for it ("sometimes it isn't there"). The ragdoll is traced
+	-- back to the bot lying in it.
+	local function BotOf(ent)
+		if not IsValid(ent) then return nil end
+
+		if ent:IsPlayer() then
+			return ent:GetNWBool("hg_bot", false) and ent or nil
+		end
+
+		if ent:GetClass() ~= "prop_ragdoll" then return nil end
+
+		local owner = hg.RagdollOwner and hg.RagdollOwner(ent)
+
+		if not IsValid(owner) then
+			local ply = ent:GetNWEntity("ply")
+
+			owner = IsValid(ply) and ply:GetNWEntity("FakeRagdoll") == ent and ply or nil
+		end
+
+		if IsValid(owner) and owner:IsPlayer() and owner:Alive() and owner:GetNWBool("hg_bot", false) then return owner end
+
+		return nil
 	end
 
 	local function BotEntFor(ent, ply, super)
-		if not IsBotEnt(ent) then return false end
+		if not BotOf(ent) then return false end
 		if not IsValid(ply) then return false end
 
 		return super and ply:IsSuperAdmin() or (not super and ply:IsAdmin())
@@ -967,6 +1149,10 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 		"Draw a name tag over every bot with its state, faction and target")
 
 	local function BotMenu(ent)
+		ent = BotOf(ent)
+
+		if not ent then return end
+
 		local ply = LocalPlayer()
 		local admin = BotEntFor(ent, ply, false)
 		local super = BotEntFor(ent, ply, true)
@@ -1052,9 +1238,36 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 		menu:AddOption(L("title"), function() hg.bots.OpenMenu() end):SetIcon("icon16/cog.png")
 
 		menu:Open()
+
+		return menu
 	end
 
 	hg.bots.OpenBotMenu = BotMenu
+
+	-- The same menu without the C menu (Z-City gamemode, or just a bind):
+	-- for the bot (or the downed bot's body) under the crosshair.
+	concommand.Add("hg_bot_menu_target", function()
+		local ply = LocalPlayer()
+
+		if not IsValid(ply) then return end
+
+		local bot = BotOf(ply:GetEyeTrace().Entity)
+
+		if not bot then return end
+
+		gui.EnableScreenClicker(true)
+
+		local menu = BotMenu(bot)
+
+		-- Hand the cursor back once the menu is gone.
+		timer.Create("hg_bot_menu_target", 0.2, 0, function()
+			if IsValid(menu) and menu:IsVisible() then return end
+
+			timer.Remove("hg_bot_menu_target")
+
+			if not IsValid(hg.bots.MenuFrame) then gui.EnableScreenClicker(false) end
+		end)
+	end, nil, "Open the bot menu for the bot you're looking at")
 
 	properties.Add("hg_bot_menu", {
 		MenuLabel = "Tarkov AI",

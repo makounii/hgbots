@@ -460,6 +460,8 @@ local hg_bot_voice_pack   = CreateConVar("hg_bot_voice_pack",   "",       {FCVAR
 			hg.bots.SayAny(bot, { "ambush", "silence" })
 		elseif newState == "grenade" then
 			hg.bots.Say(bot, "grenade", true)
+		elseif newState == "martyr" then
+			hg.bots.SayAny(bot, { "agony", "grenade" }, true)
 		elseif newState == "evadegrenade" then
 			hg.bots.Say(bot, "enemy_grenade", true)
 		elseif newState == "idle" and oldState == "combat" then

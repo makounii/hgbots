@@ -51,6 +51,12 @@ local hg_bot_grenade_max      = CreateConVar("hg_bot_grenade_max",      "1100", 
 local hg_bot_grenade_dodge    = CreateConVar("hg_bot_grenade_dodge",    "1",    {FCVAR_ARCHIVE}, "Bots run from live grenades near them", 0, 1)
 local hg_bot_grenade_danger   = CreateConVar("hg_bot_grenade_danger",   "420",  {FCVAR_ARCHIVE}, "Distance from a live frag grenade that bots consider dangerous", 50, 2000)
 
+local hg_bot_grenade_desperate = CreateConVar("hg_bot_grenade_desperate", "1",  {FCVAR_ARCHIVE}, "A badly wounded bot that still has a grenade uses it: throws it at the enemy whatever the odds, or blows itself up when they are close", 0, 1)
+local hg_bot_grenade_martyr    = CreateConVar("hg_bot_grenade_martyr",    "1",  {FCVAR_ARCHIVE}, "Badly wounded bots may blow themselves up: pin out, spoon off, and charge (or wait on the floor) with the grenade cooking in hand", 0, 1)
+local hg_bot_grenade_martyr_dist = CreateConVar("hg_bot_grenade_martyr_dist", "350", {FCVAR_ARCHIVE}, "Enemy closer than this: a desperate bot blows itself up instead of throwing", 50, 1500)
+local hg_bot_grenade_desperate_hp = CreateConVar("hg_bot_grenade_desperate_hp", "0.3", {FCVAR_ARCHIVE}, "Health fraction below which a bot counts as badly wounded", 0.05, 0.9)
+local hg_bot_grenade_desperate_blood = CreateConVar("hg_bot_grenade_desperate_blood", "3000", {FCVAR_ARCHIVE}, "Blood (of 5000) below which a bot counts as badly wounded", 1000, 5000)
+
 local hg_bot_grenade_dive     = CreateConVar("hg_bot_grenade_dive",     "1",    {FCVAR_ARCHIVE}, "Bots still in the blast when a grenade is about to go off dive away into a Z-City ragdoll", 0, 1)
 local hg_bot_grenade_dive_time = CreateConVar("hg_bot_grenade_dive_time", "1.0", {FCVAR_ARCHIVE}, "Seconds before the explosion at which an exposed bot dives", 0.1, 3)
 local hg_bot_grenade_dive_speed = CreateConVar("hg_bot_grenade_dive_speed", "430", {FCVAR_ARCHIVE}, "Horizontal speed of the dive", 100, 1200)
@@ -375,6 +381,381 @@ local DRAG_COMP = 1.08 -- physics drag shortens throws a little
 	})
 --//
 
+--\\ Last resort
+	--[[
+		A bot that is bleeding out with a grenade on its belt doesn't keep it
+		for later. Two ways to spend it:
+
+		- THROW: the ordinary throw (the "grenade" state), but without the
+		  usual conditions - the enemy may be in plain sight, closer than
+		  hg_bot_grenade_min, the cooldown and the roll don't apply.
+		- MARTYR: the enemy is close (or there is no arc to throw along):
+		  pin out (LMB held), spoon flicked off (a tap of RMB while LMB stays
+		  down - Z-City's cooking, weapon_hg_grenade_tpik's ThinkAdd), and
+		  the grenade goes off in hand once its fuse runs out (the SWEP's
+		  own Throw(0) when SpoonTime + timeToBoom passes). Standing, the
+		  bot charges whoever it is taking with it; downed, it does it from
+		  the floor (Z-City grenades work in a ragdoll, WorkWithFake).
+
+		Once the spoon is off there is no way back - ResetThrow refuses with
+		SpoonTime set - so data.Martyr keeps the grenade's button held
+		whatever state runs next (sv_bot_core.lua's movement bridge).
+		Never next to a friendly bot, or a player the bot is on the side of.
+	]]
+	local GetCharacter = function(ply)
+		return hg.bots.GetCharacter and hg.bots.GetCharacter(ply) or ply
+	end
+
+	--- Bleeding out, shot to pieces, or past what can be stopped.
+	function hg.bots.IsDesperate(bot)
+		local org = bot.organism
+
+		if org and org.otrub then return false end
+
+		local maxHP = bot:GetMaxHealth()
+
+		if maxHP > 0 and bot:Health() / maxHP < hg_bot_grenade_desperate_hp:GetFloat() then return true end
+		if not org then return false end
+		if (org.blood or 5000) < hg_bot_grenade_desperate_blood:GetFloat() then return true end
+
+		-- An artery open and nothing to close it with: minutes left.
+		if istable(org.arterialwounds) and #org.arterialwounds > 0 and not (hg.bots.FindMed and hg.bots.FindMed(bot, "arterial")) then
+			return true
+		end
+
+		return false
+	end
+
+	local function FriendlyNear(bot, pos, radius)
+		local r2 = radius * radius
+
+		for other in pairs(hg.bots.List) do
+			if other ~= bot and IsValid(other) and other:Alive()
+				and (not hg.bots.IsFriendly or hg.bots.IsFriendly(bot, other))
+				and GetCharacter(other):GetPos():DistToSqr(pos) < r2
+			then
+				return true
+			end
+		end
+
+		-- A guard bot (or one in trust mode) is on the players' side.
+		if hg.bots.IsHostile then
+			for _, ply in ipairs(player.GetHumans()) do
+				if ply:Alive() and not hg.bots.IsHostile(ply, bot) and GetCharacter(ply):GetPos():DistToSqr(pos) < r2 then
+					return true
+				end
+			end
+		end
+
+		return false
+	end
+
+	--- The enemy worth spending it on and where they are (seen in the last
+	-- few seconds), or nil.
+	local function DesperateTarget(bot, data, now)
+		local mem = data.Memory
+		local target = mem and mem.Target
+
+		if not IsValid(target) or not target:Alive() then return nil end
+
+		if hg.bots.CanSee and hg.bots.CanSee(bot, target) then
+			return target, GetCharacter(target):GetPos()
+		end
+
+		if mem.TargetPos and now - (mem.LastSeen or 0) < 6 then return target, mem.TargetPos end
+
+		return nil
+	end
+
+	--- One step of cooking the grenade in hand. Shared by the standing
+	-- "martyr" state and the downed state.
+	-- @return false once it's over (gone off, or given up)
+	local function MartyrTick(bot, data, now)
+		local wep = bot:GetActiveWeapon()
+		local inHand = IsValid(wep) and wep:GetClass() == data.MartyrClass
+		local stage = data.MartyrStage or "select"
+
+		data.Reloading = false
+
+		if stage == "select" then
+			data.Attacking = false
+			data.AttackingSecondary = false
+
+			if inHand then
+				if now - data.MartyrT > 0.5 then
+					data.MartyrStage = "pull"
+					data.MartyrT = now
+				end
+			elseif not bot:HasWeapon(data.MartyrClass or "") or now - data.MartyrT > 2.5 then
+				return false
+			elseif now >= (data.MartyrSwitchAt or 0) then
+				data.MartyrSwitchAt = now + 0.6
+				bot:SelectWeapon(data.MartyrClass)
+			end
+
+			return true
+		end
+
+		if not inHand then
+			-- Let go at our feet (the spoonless fallback below): stay on top
+			-- of it. Otherwise it has gone off, or slipped out of the hand.
+			return stage == "cook" and now - data.MartyrT < 6
+		end
+
+		if stage == "pull" then
+			data.Attacking = true
+			data.AttackingSecondary = false
+
+			if wep.ReadyToThrow then
+				data.MartyrStage = "spoon"
+				data.MartyrT = now
+			elseif now - data.MartyrT > 3 then
+				return false
+			end
+
+			return true
+		end
+
+		if stage == "spoon" then
+			-- LMB stays down - letting go would throw it. A short tap of RMB
+			-- flicks the spoon: the fuse is now running in our hand.
+			data.Attacking = true
+			data.AttackingSecondary = now - data.MartyrT < 0.25
+
+			if wep.SpoonTime or now - data.MartyrT > 1 then
+				data.MartyrStage = "cook"
+				data.MartyrT = now
+			end
+
+			return true
+		end
+
+		-- Cooking. A grenade without a spoon to flick (or one that ignored
+		-- the tap) is let go at our feet instead: switching away with the
+		-- pin out drops it live (SWEP:Holster -> Throw(0)).
+		data.Attacking = true
+		data.AttackingSecondary = false
+
+		if wep.ReadyToThrow and not wep.SpoonTime and now - data.MartyrT > 0.6 then
+			bot:SelectWeapon("weapon_hands_sh")
+		end
+
+		return now - data.MartyrT < 12
+	end
+
+	local function EndMartyr(data)
+		data.Martyr = nil
+		data.MartyrStage = nil
+		data.MartyrClass = nil
+		data.Attacking = false
+		data.AttackingSecondary = false
+	end
+
+	local function StartMartyr(bot, data, nade, now)
+		data.Martyr = true
+		data.MartyrClass = nade:GetClass()
+		data.MartyrStage = "select"
+		data.MartyrT = now
+		data.MartyrSwitchAt = 0
+		data.NextDesperate = now + 4
+	end
+
+	--- Standing bots: checked from the timer below.
+	local function TryDesperate(bot, data, now)
+		if now < (data.NextDesperate or 0) then return end
+
+		data.NextDesperate = now + 1
+
+		local st = data.State
+
+		if st == "grenade" or st == "martyr" or st == "evadegrenade" or st == "downed" then return end
+		if IsValid(bot.FakeRagdoll) or data.Refreshing then return end
+		if not hg.bots.IsDesperate(bot) then return end
+
+		local nade = hg.bots.FindGrenade(bot)
+
+		if not nade then return end
+
+		local target, tpos = DesperateTarget(bot, data, now)
+
+		if not target then return end
+
+		local myPos = bot:GetPos()
+		local dist = myPos:Distance(tpos)
+		local martyrOk = hg_bot_grenade_martyr:GetBool() and not FriendlyNear(bot, myPos, 320)
+		local martyrDist = hg_bot_grenade_martyr_dist:GetFloat()
+
+		if martyrOk and dist <= martyrDist then
+			StartMartyr(bot, data, nade, now)
+			hg.bots.SetState(bot, "martyr")
+
+			return
+		end
+
+		-- Too close to throw at without catching it ourselves is the
+		-- martyr's range; past the throwing range it's no use at all.
+		if dist > hg_bot_grenade_max:GetFloat() * 1.15 then return end
+
+		local plan = dist > 120 and not FriendlyNear(bot, tpos, 280) and hg.bots.PlanThrow(bot, tpos)
+
+		if plan then
+			local active = bot:GetActiveWeapon()
+
+			data.GrenadeClass = nade:GetClass()
+			data.GrenadePlan = plan
+			data.GrenadeTargetPos = tpos
+			data.GrenadePrevClass = IsValid(active) and active:GetClass() or nil
+			data.NextDesperate = now + 4
+
+			hg.bots.SetState(bot, "grenade")
+
+			return
+		end
+
+		-- No arc to throw along: close the distance with it cooking.
+		if martyrOk and dist <= martyrDist * 1.8 then
+			StartMartyr(bot, data, nade, now)
+			hg.bots.SetState(bot, "martyr")
+		end
+	end
+
+	timer.Create("HG_Bots_DesperateGrenade", 0.5, 0, function()
+		if not hg_bot_grenades:GetBool() or not hg_bot_grenade_desperate:GetBool() then return end
+
+		local now = CurTime()
+
+		for bot in pairs(hg.bots.List) do
+			local data = IsValid(bot) and bot:Alive() and bot.Bot
+
+			if data and data.Enabled then
+				-- Got back up with a grenade still cooking: carry on with it.
+				if data.Martyr and data.State ~= "martyr" and data.State ~= "downed" and not IsValid(bot.FakeRagdoll) then
+					hg.bots.SetState(bot, "martyr")
+				elseif not data.Martyr then
+					local ok, err = pcall(TryDesperate, bot, data, now)
+
+					if not ok then print("[hg.bots] desperate grenade error: " .. tostring(err)) end
+				end
+			end
+		end
+	end)
+
+	hg.bots.RegisterState("martyr", {
+		Enter = function(bot, data)
+			if hg.bots.ClearPath then hg.bots.ClearPath(data) end
+
+			data.Reloading = false
+			data.Crouching = false
+			data.AimSpeed = 400
+
+			-- Re-entered after getting up: keep the stage it had.
+			if not data.MartyrClass then
+				local nade = hg.bots.FindGrenade(bot)
+
+				if nade then StartMartyr(bot, data, nade, CurTime()) end
+			end
+		end,
+
+		Leave = function(bot, data)
+			data.Running = false
+			data.MoveTarget = nil
+			data.AimSpeed = nil
+
+			-- Spoon off (or pin out): it's going off whatever happens next,
+			-- keep the button down (e.g. knocked into the downed state).
+			local wep = bot:GetActiveWeapon()
+			local live = IsValid(wep) and wep:GetClass() == data.MartyrClass and (wep.SpoonTime or wep.ReadyToThrow)
+
+			if not live then EndMartyr(data) end
+		end,
+
+		Think = function(bot, data)
+			local now = CurTime()
+
+			data.NextStateThink = now + 0.05
+
+			if not data.MartyrClass or not MartyrTick(bot, data, now) then
+				EndMartyr(data)
+
+				data.NextWeaponSwitch = 0
+
+				if hg.bots.EquipBestWeapon then hg.bots.EquipBestWeapon(bot) end
+
+				local target = data.Memory.Target
+
+				hg.bots.SetState(bot, IsValid(target) and target:Alive() and (hg.bots.PickReaction and hg.bots.PickReaction(bot) or "combat") or "idle")
+
+				return
+			end
+
+			-- Taking them with us: run at whoever it is.
+			local target = data.Memory.Target
+
+			if IsValid(target) and target:Alive() then
+				local char = GetCharacter(target)
+				local tpos = char:GetPos()
+
+				data.LookPos = char:WorldSpaceCenter()
+				data.LookLock = true
+
+				if bot:GetPos():DistToSqr(tpos) > 48 * 48 then
+					data.MoveTarget = tpos
+					data.Running = true
+				else
+					data.MoveTarget = nil
+				end
+			else
+				data.MoveTarget = nil
+				data.Running = false
+			end
+		end,
+	})
+
+	--- Called first thing from the downed state's Think: a bot on the
+	-- floor with a grenade and an enemy coming at it pulls the pin there.
+	-- @return true while it is driving the bot's inputs
+	function hg.bots.DownedMartyr(bot, data, now)
+		if not data.Martyr then
+			if not hg_bot_grenades:GetBool() or not hg_bot_grenade_desperate:GetBool() or not hg_bot_grenade_martyr:GetBool() then return false end
+			if now < (data.NextDesperate or 0) then return false end
+
+			data.NextDesperate = now + 1
+
+			-- Weapons can't be swapped in a ragdoll without this
+			-- (weapons/homigrad_base/sv_fake.lua).
+			local org = bot.organism
+
+			if not (org and org.canmove) then return false end
+			if not hg.bots.IsDesperate(bot) then return false end
+
+			local nade = hg.bots.FindGrenade(bot)
+
+			if not nade then return false end
+
+			local target, tpos = DesperateTarget(bot, data, now)
+
+			if not target or bot:GetPos():DistToSqr(tpos) > hg_bot_grenade_martyr_dist:GetFloat() ^ 2 then return false end
+			if FriendlyNear(bot, bot:GetPos(), 320) then return false end
+
+			StartMartyr(bot, data, nade, now)
+		end
+
+		if not MartyrTick(bot, data, now) then
+			EndMartyr(data)
+
+			return false
+		end
+
+		data.UseKey = false
+
+		local target = data.Memory.Target
+
+		if IsValid(target) and target:Alive() then data.LookPos = GetCharacter(target):WorldSpaceCenter() end
+
+		return true
+	end
+--//
+
 --\\ Dodging
 	local live = {} -- [grenade entity] = true
 	local seenBy = {} -- [grenade] = { [bot] = react-at time }
@@ -468,6 +849,9 @@ local DRAG_COMP = 1.08 -- physics drag shortens throws a little
 				local d2 = bot:GetPos():DistToSqr(gpos)
 
 				if data.State == "evadegrenade" then continue end
+
+				-- Blowing itself up on purpose (the last resort above).
+				if data.State == "martyr" or data.Martyr then continue end
 
 				-- Mid-throw only a grenade that ended up right here matters
 				-- (a fumbled throw / bounce back), not our own in flight.

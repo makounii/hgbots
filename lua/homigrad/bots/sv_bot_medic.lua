@@ -510,6 +510,72 @@ local hg_bot_premed_wait  = CreateConVar("hg_bot_premed_wait",  "3",   {FCVAR_AR
 	end
 --//
 
+--\\ Fury-13 on spawn
+	--[[
+		The Steam-comments request: bots that come in already on Fury-13 -
+		you hear them laughing, and a few seconds later one is on top of you.
+
+		The syringe itself never reaches a bot (sv_bot_loadout.lua bans it
+		outright), so this does what weapon_fury13's SWEP:Heal does to the
+		body that takes it, minus the item: the needle sound and
+		org.berserk + 2. Z-City's organism takes it from there - the
+		berserk state, its laughter, the speed and regeneration, and the
+		slow wear-off (sv_organism.lua). Same exceptions as the item: on
+		top of norepinephrine (Fury-16) it would blow the head off, so that
+		body is skipped, and so is the "furry" class it poisons instead.
+	]]
+	local hg_bot_fury        = CreateConVar("hg_bot_fury",        "0", {FCVAR_ARCHIVE}, "Bots inject themselves with Fury-13 right after spawning (berserk: laughing, fast, hard to stop). Only the effect - the syringe is never handed out", 0, 1)
+	local hg_bot_fury_chance = CreateConVar("hg_bot_fury_chance", "1", {FCVAR_ARCHIVE}, "Share of bots that take the Fury-13 shot while hg_bot_fury is on", 0, 1)
+	local hg_bot_fury_delay  = CreateConVar("hg_bot_fury_delay",  "2", {FCVAR_ARCHIVE}, "Seconds after spawning before the Fury-13 shot", 0, 30)
+
+	--- @return true if the shot went in
+	function hg.bots.InjectFury(bot)
+		if not IsValid(bot) or not bot:Alive() then return false end
+
+		local org = bot.organism
+
+		if not istable(org) or org.alive == false then return false end
+		if (org.noradrenaline or 0) >= 0.4 then return false end
+		if bot.PlayerClassName == "furry" then return false end
+
+		local char = IsValid(bot.FakeRagdoll) and bot.FakeRagdoll or bot
+
+		char:EmitSound("snd_jack_hmcd_needleprick.wav", 80, math.random(75, 90))
+
+		org.berserk = (org.berserk or 0) + 2
+
+		return true
+	end
+
+	-- Fired by sv_bot_core.lua once per real spawn (not when a bot merely
+	-- gets back up from a ragdoll).
+	hook.Add("HG_BotNewLife", "HG_Bots_Fury", function(bot)
+		if not hg_bot_fury:GetBool() then return end
+		if math.random() > hg_bot_fury_chance:GetFloat() then return end
+
+		local life = (bot.hgBotFuryLife or 0) + 1
+
+		bot.hgBotFuryLife = life
+
+		-- After the spawn refresh and the kit (both done within ~1.2 s).
+		timer.Simple(hg_bot_fury_delay:GetFloat(), function()
+			if IsValid(bot) and bot.hgBotFuryLife == life and bot.IsHomigradBot then hg.bots.InjectFury(bot) end
+		end)
+	end)
+
+	concommand.Add("hg_bot_fury_now", function(ply)
+		if IsValid(ply) and not ply:IsAdmin() then return end
+
+		local count = 0
+
+		for bot in pairs(hg.bots.List) do
+			if hg.bots.InjectFury(bot) then count = count + 1 end
+		end
+
+		print(("[hg.bots] Fury-13: %d bots injected"):format(count))
+	end, nil, "Give every bot alive the Fury-13 shot right now")
+--//
+
 --\\ Stopping to patch up on its own
 	-- Bots that are hurt, carry something for it and aren't in a fight
 	-- right now go and use it instead of wandering around bleeding.

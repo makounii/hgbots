@@ -18,18 +18,122 @@
 	and refuses what can't go together), so a bot ends up equipped exactly
 	as a player would be.
 
-	Presets live in data/hg_bots_loadouts.json.
+	Presets live in data/hg_bots_loadouts.json, the items switched off for
+	random kits in data/hg_bots_kit_blacklist.json.
 ]]
 
 hg.bots = hg.bots or {}
 
 local hg_bot_kit_random = CreateConVar("hg_bot_kit_random", "0", {FCVAR_ARCHIVE}, "Give every newly spawned bot a random kit, even when it wasn't spawned from the menu", 0, 1)
 local hg_bot_kit_strip  = CreateConVar("hg_bot_kit_strip",  "1", {FCVAR_ARCHIVE}, "Take away whatever a bot spawned with before handing it its kit", 0, 1)
+local hg_bot_kit_adminonly = CreateConVar("hg_bot_kit_adminonly", "1", {FCVAR_ARCHIVE}, "Random kits (and the director) may hand out admin-only weapons (RPGs, AGS, PTRD...)", 0, 1)
 
 local KIT_FILE = "hg_bots_loadouts.json"
+local BLACKLIST_FILE = "hg_bots_kit_blacklist.json"
+
+--\\ Items bots never get
+	--[[
+		Z-City's joke/experimental stims - Pluviska, Fury-13 and the 'Uber'
+		Fury-16 - are never on a bot, whatever put them there: random kits,
+		the director, saved presets, the kit builder, looting, round systems.
+		Matched by class AND by display name, so a renamed copy (a _tpik
+		variant, a fork's own version) is caught as well.
+	]]
+	local BANNED_CLASSES = { weapon_pluviska = true, weapon_fury13 = true, weapon_fury16 = true }
+	local BANNED_WORDS = { "pluv", "fury", "uber" }
+
+	local bannedCache = {}
+
+	function hg.bots.IsBannedItem(class)
+		if not isstring(class) or class == "" then return false end
+
+		local cached = bannedCache[class]
+
+		if cached ~= nil then return cached end
+
+		local lower = string.lower(class)
+		local stored = weapons.GetStored(class)
+		local name = stored and string.lower(tostring(stored.PrintName or "")) or ""
+		local banned = BANNED_CLASSES[lower] or false
+
+		for _, word in ipairs(BANNED_WORDS) do
+			if banned then break end
+
+			banned = string.find(lower, word, 1, true) ~= nil or string.find(name, word, 1, true) ~= nil
+		end
+
+		-- Not registered yet: decide again once it is.
+		if stored or banned then bannedCache[class] = banned end
+
+		return banned
+	end
+
+	-- The last line of defence: whatever handed a banned item to a bot
+	-- (a round system's loadout, a loot box, another addon), it doesn't
+	-- stay. Next tick, so the Give that is still running isn't pulled out
+	-- from under itself.
+	hook.Add("WeaponEquip", "HG_Bots_NoBannedItems", function(wep, owner)
+		if not IsValid(wep) or not IsValid(owner) or not owner:IsPlayer() or not owner:IsBot() then return end
+
+		local class = wep:GetClass()
+
+		if not hg.bots.IsBannedItem(class) then return end
+
+		timer.Simple(0, function()
+			if IsValid(owner) and IsValid(wep) and wep:GetOwner() == owner then owner:StripWeapon(class) end
+		end)
+	end)
+--//
+
+--\\ Items switched off for random kits
+	--[[
+		Admins can take any weapon or armour piece out of the random rolls
+		(menu: "Random kit items"). That covers every random kit - the
+		menu's random spawn, hg_bot_kit_random, a rolled kit in the builder
+		and the director. Kits put together by hand are left alone: picking
+		an item yourself is the point of the builder.
+
+		Stored as a plain JSON array of names: util.JSONToTable turns keys
+		that look like numbers into numbers, values it leaves alone.
+	]]
+	local blacklist
+
+	local function Blacklist()
+		if blacklist then return blacklist end
+
+		blacklist = {}
+
+		local raw = file.Read(BLACKLIST_FILE, "DATA")
+		local parsed = raw and util.JSONToTable(raw)
+
+		if istable(parsed) then
+			for _, name in pairs(parsed) do
+				if isstring(name) then blacklist[name] = true end
+			end
+		end
+
+		return blacklist
+	end
+
+	function hg.bots.IsBlacklisted(name)
+		return Blacklist()[name] == true
+	end
+
+	--- Every switched-off name, sorted (for the menu).
+	function hg.bots.KitBlacklist()
+		local out = {}
+
+		for name in pairs(Blacklist()) do out[#out + 1] = name end
+
+		table.sort(out)
+
+		return out
+	end
+--//
 
 --\\ What the server has
 	local pool, poolBuiltAt
+	local rolls -- Pool() minus the blacklist, rebuilt whenever either changes
 
 	local function IsGrenadeClass(tbl)
 		return (tbl.ENT ~= nil and tbl.Throw ~= nil) or string.find(tbl.ClassName or "", "grenade") ~= nil
@@ -92,17 +196,20 @@ local KIT_FILE = "hg_bots_loadouts.json"
 
 	--- Everything worth handing out, sorted into buckets. Built once and
 	-- cached: weapons.GetList() is not cheap and the list never changes.
+	-- This is the FULL list (minus the banned items) - the menu shows it
+	-- as is; rolls go through Rolls() below, which drops the blacklist.
 	local function Pool()
 		if pool and CurTime() - poolBuiltAt < 300 then return pool end
 
 		pool = { pistol = {}, light = {}, heavy = {}, melee = {}, grenade = {}, med = {} }
 		poolBuiltAt = CurTime()
+		rolls = nil
 
 		for _, tbl in ipairs(weapons.GetList()) do
 			local class = tbl.ClassName
 
 			-- Spawnable weeds out the base classes themselves.
-			if class and tbl.Spawnable then
+			if class and tbl.Spawnable and not hg.bots.IsBannedItem(class) then
 				local chain, bases = BaseChain(tbl)
 				local function derives(set)
 					for name in pairs(set) do
@@ -140,19 +247,60 @@ local KIT_FILE = "hg_bots_loadouts.json"
 		return pool
 	end
 
+	--- What random kits actually roll from: the pool without the items an
+	-- admin switched off, and without admin-only weapons unless allowed.
+	local function Rolls()
+		local p = Pool()
+
+		if rolls then return rolls end
+
+		local adminOnly = hg_bot_kit_adminonly:GetBool()
+
+		rolls = {}
+
+		for bucket, list in pairs(p) do
+			rolls[bucket] = {}
+
+			for _, class in ipairs(list) do
+				local stored = weapons.GetStored(class)
+
+				if not hg.bots.IsBlacklisted(class) and (adminOnly or not (stored and stored.AdminOnly)) then
+					table.insert(rolls[bucket], class)
+				end
+			end
+		end
+
+		return rolls
+	end
+
+	cvars.AddChangeCallback("hg_bot_kit_adminonly", function() rolls = nil end, "HG_Bots_KitRolls")
+
+	--- Switch one weapon class or armour name on/off for random kits.
+	function hg.bots.SetBlacklisted(name, off)
+		if not isstring(name) or name == "" then return false end
+
+		Blacklist()[name] = off and true or nil
+		rolls = nil
+
+		file.Write(BLACKLIST_FILE, util.TableToJSON(hg.bots.KitBlacklist(), true))
+
+		return true
+	end
+
 	concommand.Add("hg_bot_kit_pool", function(ply)
 		if IsValid(ply) and not ply:IsAdmin() then return end
 
-		local p = Pool()
+		local p, r = Pool(), Rolls()
 
 		for bucket, list in pairs(p) do
-			print(("[hg.bots] pool %-8s %d"):format(bucket, #list))
+			print(("[hg.bots] pool %-8s %d (%d in random kits)"):format(bucket, #list, #(r[bucket] or {})))
 		end
 
 		print("[hg.bots] (all zero but melee means the weapon classification is broken again - see the comment above Pool())")
 	end, nil, "Print how many weapons of each kind the kit roller can see")
 
-	hg.bots.LoadoutPool = Pool
+	hg.bots.LoadoutPoolAll = Pool
+	hg.bots.LoadoutPool = Rolls
 
 	local function Pick(list)
 		if not list or #list == 0 then return nil end
@@ -232,7 +380,7 @@ local KIT_FILE = "hg_bots_loadouts.json"
 	--- @param tier "low" | "mid" | "high" (nil = rolled)
 	-- @param role a key of ROLES (nil = rolled to fit the tier)
 	function hg.bots.RandomLoadout(tier, role)
-		local p = Pool()
+		local p = Rolls()
 
 		if not tier or not ROLE_BY_TIER[tier] then
 			local r = math.random()
@@ -307,7 +455,7 @@ local KIT_FILE = "hg_bots_loadouts.json"
 					local names = {}
 
 					for name, info in pairs(set) do
-						if not info.nodrop then table.insert(names, name) end
+						if not info.nodrop and not hg.bots.IsBlacklisted(name) then table.insert(names, name) end
 					end
 
 					local armor = Pick(names)
@@ -341,7 +489,8 @@ local KIT_FILE = "hg_bots_loadouts.json"
 		end
 
 		for _, class in ipairs(kit.weapons or {}) do
-			local wep = bot:Give(class, true)
+			-- Presets saved before the ban can still list them.
+			local wep = isstring(class) and not hg.bots.IsBannedItem(class) and bot:Give(class, true)
 
 			-- Attachments / remaining charges from a captured preset.
 			if IsValid(wep) and kit.info and kit.info[class] and wep.SetInfo then
@@ -379,7 +528,7 @@ local KIT_FILE = "hg_bots_loadouts.json"
 		for _, wep in ipairs(ply:GetWeapons()) do
 			local class = wep:GetClass()
 
-			if class ~= "weapon_hands_sh" and class ~= "weapon_hg_coolhands" then
+			if class ~= "weapon_hands_sh" and class ~= "weapon_hg_coolhands" and not hg.bots.IsBannedItem(class) then
 				table.insert(kit.weapons, class)
 
 				if wep.GetInfo then
@@ -417,7 +566,17 @@ local KIT_FILE = "hg_bots_loadouts.json"
 		local raw = file.Read(KIT_FILE, "DATA")
 		local parsed = raw and util.JSONToTable(raw)
 
-		if istable(parsed) then kits = parsed end
+		-- util.JSONToTable turns every key that looks like a number into a
+		-- number, so a kit saved as "1" or "2077" came back keyed 2077.
+		-- table.sort then had to compare that number with the string
+		-- names of the other kits and threw ("sort - [C]:-1" from
+		-- KitNames), which killed the menu sync for everyone; GetKit("2077")
+		-- didn't find it either. Names are strings, always.
+		if istable(parsed) then
+			for name, kit in pairs(parsed) do
+				if istable(kit) then kits[tostring(name)] = kit end
+			end
+		end
 
 		return kits
 	end
@@ -427,23 +586,29 @@ local KIT_FILE = "hg_bots_loadouts.json"
 	end
 
 	function hg.bots.GetKit(name)
-		return LoadKits()[name]
+		if name == nil then return nil end
+
+		return LoadKits()[tostring(name)]
 	end
 
 	function hg.bots.KitNames()
 		local out = {}
 
-		for name in pairs(LoadKits()) do out[#out + 1] = name end
+		for name in pairs(LoadKits()) do out[#out + 1] = tostring(name) end
 
-		table.sort(out)
+		table.sort(out, function(a, b) return string.lower(a) < string.lower(b) end)
 
 		return out
 	end
 
 	function hg.bots.SaveKit(name, kit)
-		if not name or name == "" or not kit then return false end
+		if name == nil or not kit then return false end
 
-		LoadKits()[string.sub(name, 1, 40)] = kit
+		name = string.sub(string.Trim(tostring(name)), 1, 40)
+
+		if name == "" then return false end
+
+		LoadKits()[name] = kit
 
 		SaveKits()
 
@@ -451,6 +616,10 @@ local KIT_FILE = "hg_bots_loadouts.json"
 	end
 
 	function hg.bots.DeleteKit(name)
+		if name == nil then return false end
+
+		name = tostring(name)
+
 		if not LoadKits()[name] then return false end
 
 		kits[name] = nil

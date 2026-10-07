@@ -302,6 +302,8 @@ util.AddNetworkString(hg.bots.NetKits)
 	-- weapon worth handing out, sorted into the same buckets
 	-- sv_bot_loadout.lua rolls from, plus the armour pieces. Built once
 	-- (weapons.GetList is not cheap) and sent compressed with the kit list.
+	-- The FULL pool, not the random-kit one: the "Random kit items" page
+	-- has to list what is switched off too, so it can be switched back on.
 	local catalog
 
 	local function BuildCatalog()
@@ -309,7 +311,8 @@ util.AddNetworkString(hg.bots.NetKits)
 
 		catalog = { pistol = {}, light = {}, heavy = {}, melee = {}, grenade = {}, med = {}, armor = {} }
 
-		local pool = hg.bots.LoadoutPool and hg.bots.LoadoutPool()
+		local all = hg.bots.LoadoutPoolAll or hg.bots.LoadoutPool
+		local pool = all and all()
 
 		for bucket, list in pairs(pool or {}) do
 			if catalog[bucket] then
@@ -352,6 +355,7 @@ util.AddNetworkString(hg.bots.NetKits)
 			kit = kitName and kitName ~= "" and hg.bots.GetKit(kitName) or nil,
 			kitName = kitName ~= "" and kitName or nil,
 			catalog = withCatalog and BuildCatalog() or nil,
+			blacklist = hg.bots.KitBlacklist and hg.bots.KitBlacklist() or {},
 		}
 
 		local data = util.Compress(util.TableToJSON(payload))
@@ -373,7 +377,9 @@ util.AddNetworkString(hg.bots.NetKits)
 		local kit = { weapons = {}, ammo = {}, armor = {} }
 
 		for _, class in ipairs(raw.weapons or {}) do
-			if isstring(class) and weapons.Get(class) and #kit.weapons < 12 then
+			if isstring(class) and weapons.GetStored(class) and #kit.weapons < 12
+				and not (hg.bots.IsBannedItem and hg.bots.IsBannedItem(class))
+			then
 				kit.weapons[#kit.weapons + 1] = class
 			end
 		end
@@ -672,6 +678,24 @@ util.AddNetworkString(hg.bots.NetKits)
 			end
 		elseif action == "kit_delete" then
 			if hg.bots.DeleteKit(arg) then SendKits(ply) end
+		elseif action == "kit_ban" then
+			-- {name = class or armour name, off = bool}: in or out of the
+			-- random kits. Everyone with the menu open sees the change.
+			local raw = util.JSONToTable(arg or "")
+
+			if istable(raw) and isstring(raw.name) and hg.bots.SetBlacklisted
+				and hg.bots.SetBlacklisted(raw.name, raw.off == true)
+			then
+				local now = CurTime()
+
+				for other, until_ in pairs(watching) do
+					if IsValid(other) and until_ >= now and other ~= ply then SendKits(other) end
+				end
+
+				SendKits(ply)
+			end
+		elseif action == "cleanup_now" then
+			ply:ConCommand("hg_bot_cleanup_now")
 		elseif action == "spawn_guard" then
 			-- A bot on the players' side (sv_bot_factions.lua).
 			local tr = ply:GetEyeTrace()

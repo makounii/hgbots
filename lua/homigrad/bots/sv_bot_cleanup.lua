@@ -36,7 +36,7 @@ local hg_bot_cleanup_corpse  = CreateConVar("hg_bot_cleanup_corpse",  "180", {FC
 local hg_bot_cleanup_looted  = CreateConVar("hg_bot_cleanup_looted",  "45",  {FCVAR_ARCHIVE}, "Seconds an already emptied bot corpse stays", 0, 600)
 local hg_bot_cleanup_gore    = CreateConVar("hg_bot_cleanup_gore",    "45",  {FCVAR_ARCHIVE}, "Seconds gore (meat chunks, gibs) from a bot stays", 0, 600)
 local hg_bot_cleanup_drops   = CreateConVar("hg_bot_cleanup_drops",   "300", {FCVAR_ARCHIVE}, "Seconds an item dropped by a dying bot stays if nobody picks it up (0 = keep forever)", 0, 3600)
-local hg_bot_cleanup_near    = CreateConVar("hg_bot_cleanup_near",    "600", {FCVAR_ARCHIVE}, "Nothing is removed while a player is this close to it", 0, 4000)
+local hg_bot_cleanup_near    = CreateConVar("hg_bot_cleanup_near",    "350", {FCVAR_ARCHIVE}, "Nothing is removed while a player is this close to it", 0, 4000)
 local hg_bot_cleanup_gore_max = CreateConVar("hg_bot_cleanup_gore_max", "150", {FCVAR_ARCHIVE}, "Hard cap on tracked gore props: over this, the oldest go early", 10, 2000)
 local hg_bot_cleanup_all     = CreateConVar("hg_bot_cleanup_all",     "0",   {FCVAR_ARCHIVE}, "Also clean up gore and corpses that came from players, not only from bots", 0, 1)
 local hg_bot_cleanup_debug   = CreateConVar("hg_bot_cleanup_debug",   "0",   {FCVAR_ARCHIVE}, "Print what the cleanup removes", 0, 1)
@@ -112,6 +112,15 @@ local hg_bot_cleanup_debug   = CreateConVar("hg_bot_cleanup_debug",   "0",   {FC
 			if ply:Alive() and (ply.FakeRagdoll == ent or ply.FakeRagdollOld == ent) then return false end
 		end
 
+		-- Third: Z-City hands a downed player's ragdoll the player's own
+		-- organism (the "Fake" hook in organism/tier_0). A living one means
+		-- somebody is in there, whatever the two checks above concluded.
+		local org = ent.organism
+
+		if istable(org) and org.alive and IsValid(org.owner) and org.owner:IsPlayer() and org.owner:Alive() then
+			return false
+		end
+
 		return true
 	end
 
@@ -132,13 +141,36 @@ local hg_bot_cleanup_debug   = CreateConVar("hg_bot_cleanup_debug",   "0",   {FC
 --\\ Catching what bots leave behind
 	hook.Add("PlayerDeath", "HG_Bots_CleanupDeath", function(victim)
 		if not IsValid(victim) then return end
-		if not victim.IsHomigradBot and not hg_bot_cleanup_all:GetBool() then return end
 
-		-- The position is read ONCE, here. A bot is kicked out of the server
+		-- IsBot too: hg.bots.Remove clears IsHomigradBot before the kick, and
+		-- Z-City kills a player that leaves alive (its "hg-killniers"
+		-- PlayerDisconnected hook) - a bot removed from the menu died
+		-- without the flag and its body was never picked up.
+		if not victim.IsHomigradBot and not victim:IsBot() and not hg_bot_cleanup_all:GetBool() then return end
+
+		-- The body itself. Z-City's DoPlayerDeath (it runs before this)
+		-- names it on the player: the ragdoll the player was lying in, or a
+		-- fresh one. Looking for it around victim:GetPos() missed most of
+		-- them: a bot that went down first (the usual way to die in Z-City)
+		-- isn't standing where its body is, so its corpse was never
+		-- tracked and never cleaned up.
+		local rag = victim.RagdollDeath
+
+		if not IsValid(rag) then rag = victim:GetNWEntity("RagdollDeath") end
+		if not IsValid(rag) then rag = victim.FakeRagdoll end
+
+		-- Positions are read ONCE, here. A bot is kicked out of the server
 		-- shortly after it dies, so by the time the delayed passes below run
 		-- the player entity is NULL - calling victim:GetPos() in them threw
 		-- "Tried to use a NULL entity!" and killed the timer.
 		local pos = victim:GetPos()
+
+		if IsValid(rag) then
+			-- Re-checked with IsCorpse at removal time like every corpse.
+			Track(rag, "corpse")
+
+			if rag:GetPos():DistToSqr(pos) > 200 * 200 then NoteDeath(rag:GetPos()) end
+		end
 
 		NoteDeath(pos)
 

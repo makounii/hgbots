@@ -191,7 +191,7 @@ local hg_bot_flee_scavenge   = CreateConVar("hg_bot_flee_scavenge",   "700",  {F
 		-- would drop a live grenade) or out of running from one.
 		local st = bot.Bot.State
 
-		if st == "grenade" or st == "evadegrenade" then return end
+		if st == "grenade" or st == "evadegrenade" or st == "martyr" or bot.Bot.Martyr then return end
 
 		-- Gear-aware choice (flee / ambush / combat) when available. A bot
 		-- already in ambush handles being shot at itself (it relocates).

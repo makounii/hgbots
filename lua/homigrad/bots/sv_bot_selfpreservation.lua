@@ -491,6 +491,9 @@ local hg_bot_weapon_switch       = CreateConVar("hg_bot_weapon_switch",       "1
 		-- Mid-treatment: the med item stays in hand (sv_bot_medic.lua).
 		if data.State == "heal" or (data.Healing and CurTime() - data.Healing < 1) then return end
 
+		-- Cooking a grenade to go out with (sv_bot_grenades.lua).
+		if data.Martyr or data.State == "martyr" then return end
+
 		data.NextWeaponSwitch = CurTime() + 3
 
 		local active = bot:GetActiveWeapon()

@@ -26,7 +26,8 @@ hg.bots = hg.bots or {}
 		hg_bot_crawl = true, hg_bot_cqc_enabled = true, hg_bot_duel = true,
 		hg_bot_lunge = true, hg_bot_pummel = true,
 		hg_bot_grenades = true, hg_bot_grenade_dodge = true, hg_bot_grenade_dive = true,
-		hg_bot_heal = true, hg_bot_heal_premed = true, hg_bot_heal_fear = true,
+		hg_bot_grenade_desperate = true, hg_bot_grenade_martyr = true,
+		hg_bot_heal = true, hg_bot_heal_premed = true, hg_bot_heal_fear = true, hg_bot_fury = true,
 		hg_bot_downed_fight = true, hg_bot_downed_getup_when_safe = true, hg_bot_downed_ground = true,
 		hg_bot_loot_crates = true, hg_bot_loot_crate_shoot = true, hg_bot_loot_corpses = true,
 		hg_bot_squad = true, hg_bot_friendlyfire = true, hg_bot_morale = true,
@@ -36,6 +37,7 @@ hg.bots = hg.bots or {}
 		hg_bot_director = true, hg_bot_director_debug = true,
 		hg_bot_cleanup = true, hg_bot_cleanup_all = true, hg_bot_cleanup_debug = true,
 		hg_bot_stealth = true, hg_bot_laststand = true, hg_bot_kit_random = true, hg_bot_kit_strip = true,
+		hg_bot_kit_adminonly = true,
 		hg_bot_navpatch_follow = true,
 		hg_bot_debug = true, hg_bot_pathviz = true, hg_bot_navpatch_debug = true, hg_bot_morale_debug = true,
 	}
@@ -98,7 +100,7 @@ hg.bots = hg.bots or {}
 			"hg_bot_stealth", "hg_bot_stealth_range", "hg_bot_stealth_facing", "hg_bot_stealth_min",
 		}},
 		{ id = "gear", keys = {
-			"hg_bot_kit_random", "hg_bot_kit_strip",
+			"hg_bot_kit_random", "hg_bot_kit_strip", "hg_bot_kit_adminonly",
 		}},
 		{ id = "movement", keys = {
 			"hg_bot_wander_radius", "hg_bot_arrive_dist", "hg_bot_stuck_time",
@@ -127,11 +129,14 @@ hg.bots = hg.bots or {}
 			"hg_bot_grenade_min", "hg_bot_grenade_max",
 			"hg_bot_grenade_dodge", "hg_bot_grenade_danger",
 			"hg_bot_grenade_dive", "hg_bot_grenade_dive_time", "hg_bot_grenade_dive_speed",
+			"hg_bot_grenade_desperate", "hg_bot_grenade_martyr", "hg_bot_grenade_martyr_dist",
+			"hg_bot_grenade_desperate_hp", "hg_bot_grenade_desperate_blood",
 		}},
 		{ id = "medical", keys = {
 			"hg_bot_heal", "hg_bot_heal_blood", "hg_bot_heal_pain", "hg_bot_heal_safe",
 			"hg_bot_heal_timeout", "hg_bot_heal_premed", "hg_bot_premed_cap", "hg_bot_premed_wait",
 			"hg_bot_heal_fear", "hg_bot_heal_fear_at", "hg_bot_heal_fear_morale", "hg_bot_heal_adren_cap",
+			"hg_bot_fury", "hg_bot_fury_chance", "hg_bot_fury_delay",
 		}},
 		{ id = "downed", keys = {
 			"hg_bot_downed_fight", "hg_bot_downed_ground", "hg_bot_downed_ground_range",
@@ -224,6 +229,8 @@ hg.bots = hg.bots or {}
 		kit_get = "admin",
 		kit_random = "admin",
 		kit_delete = "admin",
+		kit_ban = "admin",
+		cleanup_now = "admin",
 		removeall = "superadmin",
 		navpatch = "superadmin",
 		navpatch_undo = "superadmin",

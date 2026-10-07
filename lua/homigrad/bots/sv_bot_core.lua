@@ -171,19 +171,34 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 	-- no memory, target or path carried over from a previous life, and a
 	-- bot created by something other than hg.bots.Spawn gets the AI at all.
 	local function AutoInit(ply)
-		if not hg_bot_autoinit:GetBool() then return end
 		if not IsValid(ply) or not ply:IsBot() then return end
+
+		-- Getting up from ANY ragdoll goes through hg.FakeUp, which calls
+		-- ply:Spawn() with the global OverrideSpawn set (fake/sv_tier_0.lua)
+		-- - standing up, not a new life. Z-City's own "!!!!!!" hooks
+		-- return false for it, but hook order isn't guaranteed; when ours
+		-- ran first, every bot that stood back up got its brain wiped and
+		-- was thrown into the spawn refresh ragdoll again.
+		if OverrideSpawn then return end
 
 		-- This spawn is our own refresh pass standing the bot back up
 		-- (hg.FakeUp -> ply:Spawn), not a new life: keep the brain it has.
 		if ply.Bot and ply.Bot.Refreshing then return end
 
-		-- A real spawn: the next refresh pass is allowed again.
-		ply.hgBotRefreshDone = nil
-
-		-- Both spawn hooks can fire for the same spawn - one init per tick.
+		-- Both spawn hooks can fire for the same spawn - one per tick.
 		if ply.hgBotInitTick == engine.TickCount() then return end
 		ply.hgBotInitTick = engine.TickCount()
+
+		-- A new life, whether or not the AI is (re)initialized on it
+		-- (sv_bot_medic.lua's Fury-13 shot listens for this).
+		timer.Simple(0, function()
+			if IsValid(ply) and ply:Alive() then hook.Run("HG_BotNewLife", ply) end
+		end)
+
+		if not hg_bot_autoinit:GetBool() then return end
+
+		-- A real spawn: the next refresh pass is allowed again.
+		ply.hgBotRefreshDone = nil
 
 		-- Next tick: position/loadout from the spawn itself are settled
 		-- by then (HomePos must be where the bot actually stands).
@@ -254,7 +269,10 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		end
 
 		-- Whatever it leaves behind is a bot's leftovers (sv_bot_cleanup.lua).
-		hook.Run("HG_BotRemoved", bot, bot:GetPos())
+		-- Where the BODY is: a downed bot's player entity isn't.
+		local char = IsValid(bot.FakeRagdoll) and bot.FakeRagdoll or bot
+
+		hook.Run("HG_BotRemoved", bot, char:GetPos())
 
 		hg.bots.List[bot] = nil
 		bot.IsHomigradBot = nil
@@ -622,7 +640,14 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 			local wep = ply:GetActiveWeapon()
 			local nadeInHand = IsValid(wep) and wep.Throw ~= nil and wep.ENT ~= nil and data.State ~= "grenade"
 
-			if nadeInHand then
+			if nadeInHand and data.Martyr then
+				-- Cooking it on purpose (sv_bot_grenades.lua's last resort):
+				-- LMB stays down whatever state is running - letting go
+				-- would throw it - and RMB flicks the spoon off.
+				cmd:AddKey(IN_ATTACK)
+
+				if data.AttackingSecondary then cmd:AddKey(IN_ATTACK2) end
+			elseif nadeInHand then
 				if wep.ReadyToThrow and not wep.InThrowing then
 					cmd:AddKey(wep.IsLowThrow and IN_ATTACK2 or IN_ATTACK) -- keep holding so it isn't thrown...
 					cmd:AddKey(IN_RELOAD) -- ...while the pin goes back in

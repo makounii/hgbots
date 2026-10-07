@@ -506,6 +506,10 @@ local GetAimCapability, IsArmPinned, FreeArms -- defined in the section below
 				return
 			end
 
+			-- Bleeding out with a grenade and somebody coming: the pin goes
+			-- out down here (sv_bot_grenades.lua's last resort).
+			if hg.bots.DownedMartyr and hg.bots.DownedMartyr(bot, data, now) then return end
+
 			-- Patch yourself up down here: Z-City's meds work in the
 			-- ragdoll, and bleeding out is what actually kills a downed
 			-- bot (sv_bot_medic.lua).

@@ -130,6 +130,19 @@ Lang.Add("en", {
 	["tier.high"] = "Raider",
 	["tier.any"] = "Any",
 	["role"] = "Role",
+	["act.cleanup_now"] = "Clean up bot corpses and gore now",
+	["ban.title"] = "Random kit items",
+	["ban.filter"] = "Filter items",
+	["ban.help"] = "Unticked items never turn up in random kits (random spawn, hg_bot_kit_random, a rolled kit, the AI director). Kits you build by hand are not affected. Pluviska and the Fury-13 / 'Uber' Fury-16 syringes are never given to bots at all.",
+	["cv.hg_bot_kit_adminonly"] = "Admin-only weapons in random kits",
+	["cv.hg_bot_fury"] = "Fury-13 shot right after spawning",
+	["cv.hg_bot_fury_chance"] = "Fury-13: share of bots",
+	["cv.hg_bot_fury_delay"] = "Fury-13: seconds after spawn",
+	["cv.hg_bot_grenade_desperate"] = "Badly wounded: spend the grenade",
+	["cv.hg_bot_grenade_martyr"] = "Badly wounded: may blow itself up",
+	["cv.hg_bot_grenade_martyr_dist"] = "Blow itself up when the enemy is closer than",
+	["cv.hg_bot_grenade_desperate_hp"] = "Badly wounded below health share",
+	["cv.hg_bot_grenade_desperate_blood"] = "Badly wounded below blood",
 })
 
 Lang.Add("ru", {
@@ -229,6 +242,19 @@ Lang.Add("ru", {
 	["tier.high"] = "Рейдер",
 	["tier.any"] = "Любой",
 	["role"] = "Роль",
+	["act.cleanup_now"] = "Убрать трупы и ошмётки ботов сейчас",
+	["ban.title"] = "Предметы в случайных наборах",
+	["ban.filter"] = "Фильтр",
+	["ban.help"] = "Снятые галочки - эти предметы никогда не попадут в случайный набор (случайный спавн, hg_bot_kit_random, сгенерированный набор, ИИ режиссёр). Наборы, собранные вручную, не затрагиваются. Pluviska и шприцы Fury-13 / 'Uber' Fury-16 боты не получают вообще.",
+	["cv.hg_bot_kit_adminonly"] = "Админ-оружие в случайных наборах",
+	["cv.hg_bot_fury"] = "Укол Fury-13 сразу после спавна",
+	["cv.hg_bot_fury_chance"] = "Fury-13: доля ботов",
+	["cv.hg_bot_fury_delay"] = "Fury-13: секунд после спавна",
+	["cv.hg_bot_grenade_desperate"] = "Тяжело ранен: пустить гранату в ход",
+	["cv.hg_bot_grenade_martyr"] = "Тяжело ранен: может подорвать себя",
+	["cv.hg_bot_grenade_martyr_dist"] = "Подрыв себя, если враг ближе",
+	["cv.hg_bot_grenade_desperate_hp"] = "Тяжело ранен: доля здоровья ниже",
+	["cv.hg_bot_grenade_desperate_blood"] = "Тяжело ранен: крови меньше",
 })
 
 --- Current language code.
