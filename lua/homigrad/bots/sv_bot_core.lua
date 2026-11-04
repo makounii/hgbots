@@ -32,6 +32,7 @@ hg.bots.States = hg.bots.States or {} -- [state name] = { Enter, Think, Leave }
 local hg_bot_debug = CreateConVar("hg_bot_debug", "0", {FCVAR_ARCHIVE, FCVAR_NOTIFY}, "Print Tarkov AI bot state debug info", 0, 1)
 local hg_bot_think_rate = CreateConVar("hg_bot_think_rate", "0.1", {FCVAR_ARCHIVE}, "How often (seconds) bot AI state logic ticks", 0.02, 1)
 local hg_bot_spawn_refresh = CreateConVar("hg_bot_spawn_refresh", "1", {FCVAR_ARCHIVE}, "On spawn, drop the bot into a Z-City ragdoll and instantly pick it back up. That refresh pass is what makes the server apply its clothes, armour, held weapon and arm animation - without it a freshly spawned bot can stand there with nothing applied", 0, 1)
+local hg_bot_backpedal = CreateConVar("hg_bot_backpedal", "1", {FCVAR_ARCHIVE}, "A bot keeping its eyes on someone (a locked look) walks backwards facing them when it has to move away, instead of turning its back", 0, 1)
 local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVAR_ARCHIVE}, "Default turn speed (deg/sec) used for facing/movement direction whenever a state doesn't set its own data.AimSpeed (e.g. combat's slower, deliberate aim). Used for plain walking/wandering/fleeing so bots turn into a new heading instead of snapping - a bot with no motion at all yet still turns at this rate toward whatever it's about to walk or look at.", 30, 5000)
 
 --\\ Registry & lifecycle
@@ -44,6 +45,10 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 
 		bot.Bot = {
 			Enabled = true,
+
+			-- Kept on the entity (sv_bot_factions.lua) so a re-init doesn't
+			-- turn a guard back into a raider.
+			Faction = bot.hgBotFaction,
 
 			State = "idle",
 			NextStateThink = 0,
@@ -219,13 +224,19 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 	-- @return Player the bot entity (may still be initializing - use the
 	--         "HG_BotInitialized" hook if you need to act once it's ready)
 	function hg.bots.Spawn(pos, ang, name)
-		name = name or ("Scav_" .. math.random(1000, 9999))
+		-- The admin's own name list first (sv_bot_models.lua).
+		local listed = not name and hg.bots.PickName and hg.bots.PickName()
+
+		name = name or listed or ("Scav_" .. math.random(1000, 9999))
 
 		-- NOTE: player.CreateBot no longer exists in current GMod builds.
 		-- player.CreateNextBot is (despite its name) the function that now
 		-- creates a real fake-client Player - not a NextBot NPC entity -
 		-- and it's the one that still works with GM:StartCommand.
 		local bot = player.CreateNextBot(name)
+
+		-- Z-City shows the appearance name, not this one: keep it in sync.
+		if IsValid(bot) and listed then bot.hgBotName = listed end
 
 		if not IsValid(bot) then
 			-- Always printed, not only with debug on: the usual cause is a
@@ -352,6 +363,12 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		data.State = state
 		data.NextStateThink = 0
 
+		-- A new state starts without the old one's view: a bot running from
+		-- a fight kept the last aim point at its man, and every time it
+		-- stood a moment (between flee picks) the view whipped round to it.
+		data.LookPos = nil
+		data.LookLock = nil
+
 		-- Fired between Leave and Enter so listeners can clear inputs they
 		-- own (e.g. sv_bot_melee.lua releasing a held IN_USE from bashing)
 		-- without every state needing to know about every other state's
@@ -398,7 +415,22 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 			local state = hg.bots.States[data.State]
 
 			if state and state.Think and CurTime() >= (data.NextStateThink or 0) then
-				local ok, err = pcall(state.Think, bot, data)
+				-- A look lock holds until the state thinks again (see the
+				-- movement bridge): it has to re-assert it now if it still
+				-- wants it.
+				data.LookLock = nil
+
+				local name = data.State
+
+				-- sv_bot_watch.lua's looking about rides on the idle and
+				-- alert thinks; it may also take a think over (returns true).
+				local ok, err = pcall(function()
+					if hg.bots.BeforeThink and hg.bots.BeforeThink(bot, data, name) then return end
+
+					state.Think(bot, data)
+
+					if hg.bots.AfterThink then hg.bots.AfterThink(bot, data, name) end
+				end)
 
 				if not ok then
 					print(("[hg.bots] ERROR in '%s' state Think for %s: %s"):format(tostring(data.State), tostring(bot), tostring(err)))
@@ -420,17 +452,21 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 	-- without turning" look: the body slides sideways with the head locked
 	-- on something else. A state that genuinely needs the view where it put
 	-- it (aiming at someone in sight, checking a corner, covering an angle)
-	-- sets data.LookLock every tick it needs it - the flag is cleared at the
-	-- end of every command, so a stale one can't linger. Everything else
-	-- hands the view back to the direction of travel once the two are more
-	-- than this far apart.
+	-- sets data.LookLock in its Think. The lock holds until that state
+	-- thinks again: the dispatcher clears it just before every Think, so a
+	-- state that still wants it says so again, and SetState clears it too.
+	-- (It used to be cleared after every command, 66 times a second, while
+	-- the states think every 0.1 s: a lock lasted one tick in seven, and a
+	-- bot side-stepping or backing off turned away from the man it was
+	-- shooting at for the other six.) Everything else hands the view back
+	-- to the direction of travel once the two are more than this far apart.
 	local LOOK_OFF_PATH = 65
 
-	-- Even a locked look gives way past this: walking somewhere while
-	-- staring over your own shoulder is the crab walk, and no amount of
-	-- "I am aiming at them" justifies sliding sideways backwards. A bot
-	-- that wants to keep the eyes on something further round than this
-	-- turns and goes instead.
+	-- Even a locked look gives way past this to the walking direction:
+	-- walking somewhere while staring over your own shoulder is the crab
+	-- walk. Further round than this a locked look walks BACKWARDS instead
+	-- (hg_bot_backpedal): backing off from a man in front of you facing him
+	-- is what anybody does; turning your back on him was the bug.
 	local LOOK_LOCK_MAX = 105
 
 	--- @return boolean off path, number|nil the yaw difference
@@ -479,6 +515,7 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 
 		local desiredAng = ply:EyeAngles()
 		local now = CurTime()
+		local backing = false
 
 		-- Defensive reaction (sv_bot_melee.lua's block/parry): overrides
 		-- the view for its short window so the guard faces the attacker -
@@ -499,6 +536,13 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		elseif data.LookPos and not (moveDir and LookIsOffPath(ply, data.LookPos, moveDir, data.LookLock and LOOK_LOCK_MAX or nil)) then
 			desiredAng = (data.LookPos - ply:EyePos()):Angle()
 			desiredAng.r = 0
+		elseif data.LookPos and data.LookLock and moveDir and hg_bot_backpedal:GetBool() and not IsValid(ply.FakeRagdoll) then
+			-- Locked on something behind the way we go: walk backwards,
+			-- still facing it (fm/sm below follow the view, so the feet
+			-- go backwards by themselves; no sprint backwards).
+			desiredAng = (data.LookPos - ply:EyePos()):Angle()
+			desiredAng.r = 0
+			backing = true
 		elseif moveDir then
 			-- No explicit look target (the common case while just wandering)
 			-- - face the direction we're actually walking instead of
@@ -526,6 +570,16 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		-- rather than a marker snapping between points.
 		local turnSpeed = defending and (data.DefendTurnSpeed or 900) or forcedLook and 720 or data.AimSpeed or hg_bot_move_turnspeed:GetFloat()
 		local curAng = ply:EyeAngles()
+		local tick = engine.TickCount()
+
+		-- Backing off: turn on from the view set last tick. Between two
+		-- commands a bot's view is carried a few degrees on toward where it
+		-- walks, outside any hook (measured 3.7 of a 4.5 degree step), which
+		-- otherwise left a bot backing off still well turned away from its man.
+		if backing and data.BackViewTick and tick - data.BackViewTick <= 2 then
+			curAng = data.BackView
+		end
+
 		local maxDelta = turnSpeed * FrameTime()
 
 		local eyeAng = Angle(
@@ -537,12 +591,30 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		ply:SetEyeAngles(eyeAng)
 		cmd:SetViewAngles(eyeAng)
 
+		if backing then
+			data.BackViewTick, data.BackView = tick, eyeAng
+		else
+			data.BackViewTick = nil
+		end
+
 		local fm, sm = 0, 0
 
 		-- Keep off walls / centered in narrow passages / wide of corners
 		-- (sv_bot_navigation.lua). Changes only where we step, not the view.
 		if moveDir and hg.bots.SteerMove then
+			local straight = moveDir
+
 			moveDir = hg.bots.SteerMove(ply, data, moveDir)
+
+			-- The bend away from a wall must not be what steps off an edge:
+			-- the ledge guard below drops the whole path when it would, and
+			-- the path came straight back - over and over. Where the straight
+			-- way is safe and the bent one is not, go straight.
+			if moveDir ~= straight and hg.bots.IsStepSafe
+				and not hg.bots.IsStepSafe(ply, moveDir) and hg.bots.IsStepSafe(ply, straight)
+			then
+				moveDir = straight
+			end
 		end
 
 		if moveDir then
@@ -704,9 +776,17 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 			cmd:AddKey(IN_WALK)
 		end
 
-		-- Per-tick: whoever still needs the view re-asserts it next tick.
-		data.LookLock = nil
+		-- (data.LookLock is NOT cleared here: it holds until the state's next
+		-- Think - see the dispatcher.)
+
+		-- For other add-ons that drive a bot's keys on top of this command
+		-- (they run after it, whatever order the hook table gives).
+		hook.Run("HG_BotCommand", ply, cmd, data)
 	end, HOOK_HIGH)
+
+	-- Tells add-ons that this builder runs HG_BotCommand, so they need not
+	-- wrap it to get after it.
+	hg.bots.CommandHook = true
 --//
 
 --\\ Debug / testing concommands

@@ -64,7 +64,8 @@ local hg_bot_path_trace_z    = CreateConVar("hg_bot_path_trace_z",    "24",   {F
 local hg_bot_step_height     = CreateConVar("hg_bot_step_height",     "22",   {FCVAR_ARCHIVE}, "Maximum height change between path samples still considered walkable (Source's default step height is 18)", 8, 64)
 local hg_bot_max_drop        = CreateConVar("hg_bot_max_drop",        "90",   {FCVAR_ARCHIVE}, "Maximum drop (units) a bot will willingly walk off. Beyond this a route is treated as a ledge and rejected", 32, 512)
 local hg_bot_ground_sample   = CreateConVar("hg_bot_ground_sample",   "28",   {FCVAR_ARCHIVE}, "Spacing (units) between ground samples when validating a path segment - smaller catches narrower gaps but costs more traces", 8, 128)
-local hg_bot_avoid_water     = CreateConVar("hg_bot_avoid_water",     "1",    {FCVAR_ARCHIVE}, "Treat water as impassable when validating paths and ledges", 0, 1)
+local hg_bot_avoid_water     = CreateConVar("hg_bot_avoid_water",     "1",    {FCVAR_ARCHIVE}, "Treat water deeper than hg_bot_wade_depth as impassable when validating paths and ledges", 0, 1)
+local hg_bot_wade_depth      = CreateConVar("hg_bot_wade_depth",      "40",   {FCVAR_ARCHIVE}, "Water up to this deep (units; a player's waist is about 36) is walked through; deeper is avoided while hg_bot_avoid_water is on. 0 = any water is avoided", 0, 200)
 local hg_bot_ledge_guard     = CreateConVar("hg_bot_ledge_guard",     "1",    {FCVAR_ARCHIVE}, "Last-resort movement check: refuse to step off a drop bigger than hg_bot_max_drop even if the current path says to", 0, 1)
 local hg_bot_astar_max_nodes = CreateConVar("hg_bot_astar_max_nodes", "4000", {FCVAR_ARCHIVE}, "Max nav areas expanded per A* search before giving up", 100, 50000)
 local hg_bot_path_budget     = CreateConVar("hg_bot_path_budget",     "3",    {FCVAR_ARCHIVE}, "Max A* searches per server tick across all bots; extra requests wait for the next tick", 1, 64)
@@ -88,6 +89,66 @@ local UP_VEC = Vector(0, 0, 1)
 local HULL_MINS = Vector(-15, -15, 0)
 local HULL_MAXS = Vector(15, 15, 20)
 
+--\\ Water
+	-- Shallow water is ground to walk on, deep water is a ledge. Any water
+	-- used to be a cliff: a bot with a puddle round its feet found every
+	-- step "unsafe" (the ledge guard in the movement bridge runs this file's
+	-- ground check every tick) and stood there for good, and the path search
+	-- refused every nav area the engine marks underwater - which it does
+	-- with water 1 unit above the floor.
+
+	--- Water still there wading-deep above this floor point?
+	local function DeepAt(floor)
+		local depth = hg_bot_wade_depth:GetFloat()
+
+		if depth <= 0 then return true end
+
+		return bit.band(util.PointContents(floor + Vector(0, 0, depth)), CONTENTS_WATER) ~= 0
+	end
+
+	--- Already in water to the waist or deeper: any way out is a good one,
+	-- so nothing about water stops this bot.
+	local function InDeepWater(ent)
+		return IsValid(ent) and ent:IsPlayer() and ent:WaterLevel() >= 2
+	end
+
+	local areaDeep, areaDeepAt = {}, nil
+
+	--- An underwater nav area too deep to wade: deep at its middle or at
+	-- two of its corners. (Cached by area id, per wading depth.)
+	function hg.bots.IsDeepWaterArea(area)
+		if not area:IsUnderwater() then return false end
+
+		local depth = hg_bot_wade_depth:GetFloat()
+
+		if areaDeepAt ~= depth then areaDeep, areaDeepAt = {}, depth end
+
+		local id = area:GetID()
+		local deep = areaDeep[id]
+
+		if deep == nil then
+			deep = DeepAt(area:GetCenter() + UP_VEC)
+
+			if not deep then
+				local n = 0
+
+				for i = 0, 3 do
+					if DeepAt(area:GetCorner(i) + UP_VEC) then n = n + 1 end
+				end
+
+				deep = n >= 2
+			end
+
+			areaDeep[id] = deep
+		end
+
+		return deep
+	end
+
+	-- A new navmesh (or one patched) gets its areas looked at afresh.
+	hook.Add("PostCleanupMap", "HG_Bots_WaterAreas", function() areaDeep = {} end)
+--//
+
 --\\ Ground checks
 	-- Ground traces count props/ramps as floor; players and NPCs don't.
 	local function groundFilter(ent)
@@ -99,7 +160,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 
 	--- Is there continuous, walkable ground along the straight line a->b?
 	-- A clearance trace only answers "is there a wall"; this answers "is
-	-- there a floor" - no pits, no cliffs, no water.
+	-- there a floor" - no pits, no cliffs, no deep water.
 	local function IsSegmentWalkable(a, b, filterEnt)
 		local dist = a:Distance(b)
 
@@ -108,7 +169,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 		local stepHeight = hg_bot_step_height:GetFloat()
 		local maxDrop = hg_bot_max_drop:GetFloat()
 		local spacing = hg_bot_ground_sample:GetFloat()
-		local avoidWater = hg_bot_avoid_water:GetBool()
+		local avoidWater = hg_bot_avoid_water:GetBool() and not InDeepWater(filterEnt)
 
 		local steps = math.ceil(dist / spacing)
 		local delta = (b - a) / steps
@@ -130,9 +191,10 @@ local HULL_MAXS = Vector(15, 15, 20)
 			if not tr.Hit then return false end
 
 			if avoidWater then
-				local contents = util.PointContents(tr.HitPos + Vector(0, 0, 2))
+				local floor = tr.HitPos + Vector(0, 0, 2)
+				local contents = util.PointContents(floor)
 
-				if bit.band(contents, CONTENTS_WATER) ~= 0 then return false end
+				if bit.band(contents, CONTENTS_WATER) ~= 0 and DeepAt(floor) then return false end
 				if bit.band(contents, CONTENTS_SLIME) ~= 0 then return false end
 			end
 
@@ -275,9 +337,11 @@ local HULL_MAXS = Vector(15, 15, 20)
 		local mult = 1
 
 		if to:IsUnderwater() then
-			if avoidWater then return nil end
+			local deep = hg.bots.IsDeepWaterArea(to)
 
-			mult = mult * 3
+			if deep and avoidWater then return nil end
+
+			mult = mult * (deep and 3 or 1.5) -- wading is slow going
 		end
 
 		if not relaxed and to.IsBlocked and to:IsBlocked() then return nil end
@@ -443,7 +507,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 			opts.avoidArea = navmesh.GetNavArea(opts.avoidPos, 128)
 		end
 
-		local avoidWater = hg_bot_avoid_water:GetBool()
+		local avoidWater = hg_bot_avoid_water:GetBool() and not InDeepWater(filterEnt)
 		local maxDrop = hg_bot_max_drop:GetFloat()
 		local climb = hg_bot_climb_height:GetFloat()
 		local maxNodes = hg_bot_astar_max_nodes:GetInt()
@@ -1641,6 +1705,28 @@ local HULL_MAXS = Vector(15, 15, 20)
 					if IsSegmentClear(pos, nextWp, bot) then
 						data.MoveTarget = nil
 					end
+				elseif d2 < 160 * 160 and nextWp and not data.NavJumpAt
+					and now >= (data.NextCornerCheck or 0)
+				then
+					-- Gone past it wider than that: a running bot carried on
+					-- by its momentum, or pushed aside by the wall steering,
+					-- turned back to touch the waypoint and circled it. Past
+					-- the end of its leg with the next one in sight counts
+					-- as reached. (A climb is reached by height, not this.)
+					local from = data.Path[data.PathIndex - 2] or data.LegFrom
+
+					if from then
+						local lx, ly = mt.x - from.x, mt.y - from.y
+						local len2 = lx * lx + ly * ly
+
+						if len2 > 16 * 16 and (pos.x - from.x) * lx + (pos.y - from.y) * ly > len2 then
+							data.NextCornerCheck = now + 0.1
+
+							if IsSegmentClear(pos, nextWp, bot) then
+								data.MoveTarget = nil
+							end
+						end
+					end
 				end
 			end
 		end
@@ -1655,6 +1741,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 			local f = data.PathFlags and data.PathFlags[data.PathIndex] or 0
 
 			data.MoveTarget = data.Path[data.PathIndex]
+			data.LegFrom = pos -- where this leg starts, for the gone-past check above
 			data.NavCrouch = bit.band(f, FLAG_CROUCH) ~= 0
 			data.NavJumpAt = bit.band(f, FLAG_JUMP) ~= 0 and data.MoveTarget or nil
 			data.PathIndex = data.PathIndex + 1
@@ -1825,7 +1912,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 				if not seen[id] then
 					seen[id] = true
 
-					if n:GetCenter():DistToSqr(startPos) < r2 and not n:IsUnderwater() then
+					if n:GetCenter():DistToSqr(startPos) < r2 and not hg.bots.IsDeepWaterArea(n) then
 						queue[#queue + 1] = n
 					end
 				end
@@ -1839,7 +1926,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 	-- bot's home: when the bot has drifted far from it, candidates closer
 	-- to home win.
 	-- @return Vector|nil, string reason when nil (for hg_bot_navdebug)
-	function hg.bots.GetRandomWanderPoint(bot)
+	local function PickWanderPoint(bot)
 		local data = bot.Bot
 		local pos = bot:GetPos()
 		local home = (data and data.HomePos) or pos
@@ -1910,6 +1997,16 @@ local HULL_MAXS = Vector(15, 15, 20)
 		end
 
 		return nil, "no navmesh and no walkable direction found"
+	end
+
+	--- The point handed out is remembered (data.WanderPt): a walk to it is a
+	-- stroll, which sv_bot_watch.lua may cut short or linger at the end of.
+	function hg.bots.GetRandomWanderPoint(bot)
+		local pt, why = PickWanderPoint(bot)
+
+		if pt and bot.Bot then bot.Bot.WanderPt = hg.bots.SnapToNavmesh(pt) or pt end
+
+		return pt, why
 	end
 
 	--- Last-resort movement: a short straight walk in any direction whose

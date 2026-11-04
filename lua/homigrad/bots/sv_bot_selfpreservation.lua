@@ -184,7 +184,7 @@ local hg_bot_weapon_switch       = CreateConVar("hg_bot_weapon_switch",       "1
 		for _ = 1, samples do
 			local area = areas[math.random(#areas)]
 
-			if IsValid(area) and not area:IsUnderwater() then
+			if IsValid(area) and not hg.bots.IsDeepWaterArea(area) then -- (wading-deep water is fine)
 				local spots = area.GetHidingSpots and area:GetHidingSpots()
 				local point = (spots and #spots > 0) and spots[math.random(#spots)] or area:GetRandomPoint()
 
@@ -279,6 +279,10 @@ local hg_bot_weapon_switch       = CreateConVar("hg_bot_weapon_switch",       "1
 
 		Think = function(bot, data)
 			data.NextStateThink = CurTime() + 0.1
+
+			-- Hiding with bare fists and its man shows up: out of hiding
+			-- (sv_bot_nerve.lua) - fists are no weapon to the code below.
+			if hg.bots.NerveHoldCheck and hg.bots.NerveHoldCheck(bot, data) then return end
 
 			local mem = data.Memory
 			local target = mem.Target
@@ -602,20 +606,29 @@ local hg_bot_weapon_switch       = CreateConVar("hg_bot_weapon_switch",       "1
 		local mine = hg.bots.GetWeaponKind(bot, true)
 		local theirs = hg.bots.GetEnemyWeaponKind(bot, target)
 
+		-- Cornered a moment ago with nowhere to run (sv_bot_flee.lua): it
+		-- fights, and is not sent running again straight away.
+		local cornered = now < (data.CorneredUntil or 0)
+
 		-- Running from someone you outgun (they have no gun, you do) is
-		-- worse than shooting them.
-		if hg.bots.ShouldFlee and hg.bots.ShouldFlee(bot) and not (mine == "gun" and theirs ~= "gun") then
+		-- worse than shooting them. (ShouldFlee asks the nerve reckoning.)
+		if not cornered and hg.bots.ShouldFlee and hg.bots.ShouldFlee(bot) and not (mine == "gun" and theirs ~= "gun") then
 			return "flee"
 		end
 
 		-- No weapon at all (fists don't count): anyone armed, or bullets
-		-- flying, means scatter and hide. Fists against fists is a brawl.
+		-- flying, means scatter and hide - unless the reckoning of the
+		-- fight says it is going his way (sv_bot_nerve.lua: every blow is
+		-- "being under fire", so a fist fight used to end at the first
+		-- punch). Fists against fists is a brawl.
 		if mine == "none" then
 			-- A body that can't run anymore brawls instead (last stand,
 			-- sv_bot_flee.lua).
-			local canRun = not hg.bots.CanRetreat or hg.bots.CanRetreat(bot)
+			local canRun = not cornered and (not hg.bots.CanRetreat or hg.bots.CanRetreat(bot))
 
-			if canRun and (theirs ~= "none" or (mem.UnderFireUntil or 0) > now) then
+			if canRun and (theirs ~= "none" or (mem.UnderFireUntil or 0) > now)
+				and not (hg.bots.NerveOn and hg.bots.NerveOn() and hg.bots.NerveVerdict(bot) == "stand")
+			then
 				return "flee"
 			end
 
@@ -855,7 +868,7 @@ local hg_bot_weapon_switch       = CreateConVar("hg_bot_weapon_switch",       "1
 		for _ = 1, math.min(hg_bot_ambush_samples:GetInt(), #areas) do
 			local area = areas[math.random(#areas)]
 
-			if IsValid(area) and not area:IsUnderwater() then
+			if IsValid(area) and not hg.bots.IsDeepWaterArea(area) then -- (wading-deep water is fine)
 				local spots = area.GetHidingSpots and area:GetHidingSpots()
 				local p = (spots and #spots > 0) and spots[math.random(#spots)] or area:GetRandomPoint()
 				local de = p:Distance(enemyPos)
@@ -1042,6 +1055,32 @@ local hg_bot_weapon_switch       = CreateConVar("hg_bot_weapon_switch",       "1
 				data.Crouching = close
 
 				if not hg.bots.FollowPath(bot, data) then return end
+			end
+
+			-- No route to the spot (refused, or given up on stuck): the
+			-- code below would walk a straight line at it, into whatever
+			-- stands between. Ask for the route again (twice at most), then
+			-- give the ambush up - ChooseReaction fights instead for a while,
+			-- as when no spot is found at all.
+			if data.AmbushPos and not data.Path and not data.PendingGoal
+				and myPos:DistToSqr(data.AmbushPos) > 150 * 150 -- (there, or peeking round its corner)
+			then
+				if data.AmbushRouteSpot ~= data.AmbushPos then
+					data.AmbushRouteSpot, data.AmbushRouteTries = data.AmbushPos, 0
+				end
+
+				if now < (data.AmbushRouteRetry or 0) then return end
+
+				data.AmbushRouteRetry = now + 2
+				data.AmbushRouteTries = data.AmbushRouteTries + 1
+
+				if data.AmbushRouteTries > 2 or not hg.bots.SetGoal(bot, data.AmbushPos, { avoidPos = mem.TargetPos, avoidRadius = 700, avoidWeight = 3, force = true }) then
+					data.AmbushPos, data.AmbushCorner = nil, nil
+					data.AmbushFailUntil = now + 6
+					data.MoveTarget = nil
+				end
+
+				return
 			end
 
 			if not data.AmbushPos then

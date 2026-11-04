@@ -16,6 +16,7 @@
 
 AddCSLuaFile("sh_bot_lang.lua")
 AddCSLuaFile("sh_bot_settings.lua")
+AddCSLuaFile("sh_bot_director_ent.lua")
 AddCSLuaFile("cl_bot_menu.lua")
 
 hg.bots = hg.bots or {}
@@ -356,6 +357,9 @@ util.AddNetworkString(hg.bots.NetKits)
 			kitName = kitName ~= "" and kitName or nil,
 			catalog = withCatalog and BuildCatalog() or nil,
 			blacklist = hg.bots.KitBlacklist and hg.bots.KitBlacklist() or {},
+			modelPool = hg.bots.ModelPool and hg.bots.ModelPool() or {},
+			botNames = hg.bots.NameList and hg.bots.NameList() or {},
+			voicePacks = hg.bots.VoicePackList and hg.bots.VoicePackList() or {},
 		}
 
 		local data = util.Compress(util.TableToJSON(payload))
@@ -696,16 +700,96 @@ util.AddNetworkString(hg.bots.NetKits)
 			end
 		elseif action == "cleanup_now" then
 			ply:ConCommand("hg_bot_cleanup_now")
-		elseif action == "spawn_guard" then
-			-- A bot on the players' side (sv_bot_factions.lua).
+		elseif action == "model_set" then
+			-- One bot's model (sv_bot_models.lua); "" = back to default.
+			if IsValid(ent) and ent.IsHomigradBot and hg.bots.SetBotModel and hg.bots.SetBotModel(ent, arg) then
+				Tell(ply, "raw", ent:Nick() .. ": " .. (arg ~= "" and arg or "default model"))
+			end
+		elseif action == "model_all" then
+			-- Every bot alive gets this model.
+			if hg.bots.SetBotModel and hg.bots.IsAllowedModel and hg.bots.IsAllowedModel(arg) then
+				local count = 0
+
+				for bot in pairs(hg.bots.List or {}) do
+					if IsValid(bot) and bot:Alive() and hg.bots.SetBotModel(bot, arg) then count = count + 1 end
+				end
+
+				Tell(ply, "raw", ("%s -> %d bots"):format(arg, count))
+			end
+		elseif action == "model_pool" then
+			-- {mdl = path, on = bool}: in or out of the random pool.
+			local raw = util.JSONToTable(arg or "")
+
+			if istable(raw) and isstring(raw.mdl) and hg.bots.SetModelInPool
+				and hg.bots.SetModelInPool(raw.mdl, raw.on == true)
+			then
+				local now = CurTime()
+
+				for other, until_ in pairs(watching) do
+					if IsValid(other) and until_ >= now and other ~= ply then SendKits(other) end
+				end
+
+				SendKits(ply)
+			end
+		elseif action == "model_reroll" then
+			if hg.bots.RerollModels then Tell(ply, "raw", ("models re-rolled: %d bots"):format(hg.bots.RerollModels())) end
+		elseif action == "names_set" then
+			-- The whole list, one JSON array of names.
+			local list = util.JSONToTable(arg or "")
+
+			if istable(list) and hg.bots.SetNameList then
+				Tell(ply, "raw", ("names saved: %d"):format(hg.bots.SetNameList(list)))
+				SendKits(ply)
+			end
+		elseif action == "name_set" then
+			if IsValid(ent) and ent.IsHomigradBot and hg.bots.SetBotName and hg.bots.SetBotName(ent, arg) then
+				Tell(ply, "raw", ent:Nick() .. " -> " .. (arg ~= "" and arg or "default name"))
+			end
+		elseif action == "voice_pack" then
+			-- {name = pack, on = bool}: may bots use this voice pack?
+			local raw = util.JSONToTable(arg or "")
+
+			if istable(raw) and isstring(raw.name) and hg.bots.SetVoicePackOn
+				and hg.bots.SetVoicePackOn(raw.name, raw.on == true)
+			then
+				local now = CurTime()
+
+				for other, until_ in pairs(watching) do
+					if IsValid(other) and until_ >= now and other ~= ply then SendKits(other) end
+				end
+
+				SendKits(ply)
+			end
+		elseif action == "voice_set" then
+			-- One bot's voice pack; "" = automatic.
+			if IsValid(ent) and ent.IsHomigradBot and hg.bots.SetBotVoice and hg.bots.SetBotVoice(ent, arg) then
+				Tell(ply, "raw", ent:Nick() .. ": voice " .. (arg ~= "" and arg or "automatic"))
+
+				if hg.bots.Say then hg.bots.Say(ent, "roger", true) end
+			end
+		elseif action == "voice_reload" then
+			if hg.bots.LoadVoice then
+				Tell(ply, "raw", ("voice lines loaded: %d"):format(hg.bots.LoadVoice()))
+				SendKits(ply)
+			end
+		elseif action == "director_on" or action == "director_off" then
+			if hg.bots.DirectorSetEnabled then
+				hg.bots.DirectorSetEnabled(action == "director_on")
+				Broadcast("hg_bot_director", action == "director_on" and 1 or 0)
+				Tell(ply, "raw", "director " .. (action == "director_on" and "on" or "off"))
+			end
+		elseif action == "spawn_guard" or action == "spawn_neutral" then
+			-- A bot on the players' side, or one that leaves everybody
+			-- alone until attacked (sv_bot_factions.lua).
 			local tr = ply:GetEyeTrace()
 			local bot = (arg ~= "" and hg.bots.SpawnWithKit and hg.bots.SpawnWithKit(tr.HitPos + Vector(0, 0, 8), ply:EyeAngles(), arg))
 				or hg.bots.Spawn(tr.HitPos + Vector(0, 0, 8), ply:EyeAngles())
 
-			if IsValid(bot) then
-				timer.Simple(0.25, function()
-					if IsValid(bot) and hg.bots.SetFaction then hg.bots.SetFaction(bot, "guard") end
-				end)
+			-- Right away, on the entity: hg.bots.Init (a couple of ticks
+			-- later) keeps it. A delayed SetFaction used to lose that race
+			-- now and then and leave a hostile bot.
+			if IsValid(bot) and hg.bots.SetFaction then
+				hg.bots.SetFaction(bot, action == "spawn_guard" and "guard" or "neutral")
 			end
 		elseif action == "director_place" then
 			ply:ConCommand("hg_bot_director_place")

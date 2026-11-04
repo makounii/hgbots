@@ -37,9 +37,11 @@ hg.bots = hg.bots or {}
 		hg_bot_director = true, hg_bot_director_debug = true,
 		hg_bot_cleanup = true, hg_bot_cleanup_all = true, hg_bot_cleanup_debug = true,
 		hg_bot_stealth = true, hg_bot_laststand = true, hg_bot_kit_random = true, hg_bot_kit_strip = true,
-		hg_bot_kit_adminonly = true,
+		hg_bot_kit_adminonly = true, hg_bot_model_mode = true,
 		hg_bot_navpatch_follow = true,
 		hg_bot_debug = true, hg_bot_pathviz = true, hg_bot_navpatch_debug = true, hg_bot_morale_debug = true,
+		hg_bot_sight_attention = true, hg_bot_watch = true, hg_bot_nerve = true, hg_bot_nerve_debug = true,
+		hg_bot_flee_keep = true, hg_bot_flee_ways = true, hg_bot_backpedal = true,
 	}
 
 	-- Parameters only a superadmin may touch (they change how the server
@@ -70,10 +72,12 @@ hg.bots = hg.bots or {}
 			"hg_bot_suppression_gain", "hg_bot_suppression_decay",
 			"hg_bot_trust", "hg_bot_trust_forgive", "hg_bot_trust_forget_on_death",
 			"hg_bot_aim_threat_time", "hg_bot_shooter_window",
+			"hg_bot_sight_attention", "hg_bot_voice_radius",
 		}},
 		{ id = "alert", keys = {
 			"hg_bot_alert", "hg_bot_alert_time", "hg_bot_alert_trigger",
 			"hg_bot_alert_posture", "hg_bot_alert_close", "hg_bot_alert_patrol",
+			"hg_bot_watch", "hg_bot_watch_vigil", "hg_bot_watch_linger",
 		}},
 		{ id = "combat", keys = {
 			"hg_bot_engage_dist", "hg_bot_backoff_frac", "hg_bot_chase_lead",
@@ -93,20 +97,21 @@ hg.bots = hg.bots or {}
 			"hg_bot_ambush_charge_dist", "hg_bot_ambush_backstab_dist", "hg_bot_ambush_time",
 			"hg_bot_flee_health_frac", "hg_bot_flee_chance", "hg_bot_flee_dist",
 			"hg_bot_flee_safe_dist", "hg_bot_flee_recheck",
-			"hg_bot_flee_turnback", "hg_bot_flee_scavenge",
+			"hg_bot_flee_turnback", "hg_bot_flee_scavenge", "hg_bot_flee_keep", "hg_bot_flee_ways",
+			"hg_bot_nerve", "hg_bot_nerve_grit",
 			"hg_bot_laststand", "hg_bot_laststand_blood", "hg_bot_laststand_shock",
 		}},
 		{ id = "stealth", keys = {
 			"hg_bot_stealth", "hg_bot_stealth_range", "hg_bot_stealth_facing", "hg_bot_stealth_min",
 		}},
 		{ id = "gear", keys = {
-			"hg_bot_kit_random", "hg_bot_kit_strip", "hg_bot_kit_adminonly",
+			"hg_bot_kit_random", "hg_bot_kit_strip", "hg_bot_kit_adminonly", "hg_bot_model_mode",
 		}},
 		{ id = "movement", keys = {
 			"hg_bot_wander_radius", "hg_bot_arrive_dist", "hg_bot_stuck_time",
 			"hg_bot_path_smoothing", "hg_bot_smooth_lookahead", "hg_bot_path_trace_z",
 			"hg_bot_step_height", "hg_bot_climb_height", "hg_bot_max_drop",
-			"hg_bot_ground_sample", "hg_bot_avoid_water", "hg_bot_ledge_guard",
+			"hg_bot_ground_sample", "hg_bot_avoid_water", "hg_bot_wade_depth", "hg_bot_ledge_guard", "hg_bot_backpedal",
 			"hg_bot_astar_max_nodes", "hg_bot_path_budget",
 			"hg_bot_crawl", "hg_bot_crawl_cycle", "hg_bot_crawl_time",
 			"hg_bot_crawl_range", "hg_bot_crawl_arrive",
@@ -162,10 +167,10 @@ hg.bots = hg.bots or {}
 		{ id = "voice", keys = {
 			"hg_bot_voice", "hg_bot_voice_chatter", "hg_bot_voice_swear",
 			"hg_bot_voice_gap", "hg_bot_voice_world", "hg_bot_voice_range",
-			"hg_bot_voice_volume", "hg_bot_voice_fastdl",
+			"hg_bot_voice_volume", "hg_bot_voice_fastdl", "hg_bot_voice_pitch",
 		}},
 		{ id = "factions", keys = {
-			"hg_bot_factions", "hg_bot_guard_follow",
+			"hg_bot_factions", "hg_bot_guard_follow", "hg_bot_neutral_memory", "hg_bot_neutral_help",
 			"hg_bot_npc", "hg_bot_npc_range",
 		}},
 		{ id = "director", keys = {
@@ -186,6 +191,7 @@ hg.bots = hg.bots or {}
 		}},
 		{ id = "debug", keys = {
 			"hg_bot_debug", "hg_bot_pathviz", "hg_bot_navpatch_debug", "hg_bot_morale_debug",
+			"hg_bot_watch_debug", "hg_bot_nerve_debug",
 		}},
 	}
 
@@ -231,6 +237,18 @@ hg.bots = hg.bots or {}
 		kit_delete = "admin",
 		kit_ban = "admin",
 		cleanup_now = "admin",
+		model_set = "admin",
+		model_all = "admin",
+		model_pool = "admin",
+		model_reroll = "admin",
+		names_set = "admin",
+		name_set = "admin",
+		voice_pack = "admin",
+		voice_set = "admin",
+		voice_reload = "admin",
+		spawn_neutral = "superadmin",
+		director_on = "superadmin",
+		director_off = "superadmin",
 		removeall = "superadmin",
 		navpatch = "superadmin",
 		navpatch_undo = "superadmin",

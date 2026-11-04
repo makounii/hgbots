@@ -182,6 +182,12 @@ local hg_bot_morale_debug   = CreateConVar("hg_bot_morale_debug",   "0",    {FCV
 		local hit = fatal and hg_bot_morale_kill:GetFloat() or hg_bot_morale_hurt:GetFloat()
 		local anger = fatal and 0.6 or 0.15
 
+		-- A punch or a blade is not a bullet: a blow from someone without a
+		-- gun shakes the rest much less (sv_bot_nerve.lua's fist fights).
+		if not fatal and hg.bots.GetWeaponKind and hg.bots.GetWeaponKind(attacker, false) ~= "gun" then
+			hit = hit * 0.4
+		end
+
 		-- The one being hit takes it hardest.
 		Notify(victim, attacker, hit * 0.5, anger, fatal and "killed" or "hurt")
 

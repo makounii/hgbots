@@ -91,6 +91,9 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 	local kits = {}
 	local catalog = {}
 	local banned = {} -- [class or armour name] = true: off for random kits
+	local modelPool = {} -- [lower-case model path] = true: ticked on "Bot models"
+	local botNames = {} -- the name list new bots take their names from
+	local voicePacks = {} -- { {name, lines, sex, on, builtin}, ... }
 	local incoming -- the last kit the server sent back, for the builder
 
 	net.Receive(hg.bots.NetKits, function()
@@ -108,6 +111,15 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 			banned = {}
 
 			for _, name in pairs(payload.blacklist) do banned[tostring(name)] = true end
+		end
+
+		if istable(payload.botNames) then botNames = payload.botNames end
+		if istable(payload.voicePacks) then voicePacks = payload.voicePacks end
+
+		if istable(payload.modelPool) then
+			modelPool = {}
+
+			for _, mdl in pairs(payload.modelPool) do modelPool[string.lower(tostring(mdl))] = true end
 		end
 
 		if istable(payload.kit) then
@@ -438,10 +450,13 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 		Button(panel, L("act.spawn"), dark, function() Act("spawn") end)
 		Button(panel, L("act.spawn_random"), dark, function() Act("spawn_random") end)
 		Button(panel, L("act.spawn_guard"), dark, function() Act("spawn_guard") end)
+		Button(panel, L("act.spawn_neutral"), dark, function() Act("spawn_neutral") end)
 		Button(panel, L("act.removeall"), dark, function() Act("removeall") end)
 
 		Button(panel, L("act.cleanup_now"), dark, function() Act("cleanup_now") end)
 
+		Button(panel, L("act.director_on"), dark, function() Act("director_on") end)
+		Button(panel, L("act.director_off"), dark, function() Act("director_off") end)
 		Button(panel, L("act.director_place"), dark, function() Act("director_place") end)
 		Button(panel, L("act.director_status"), dark, function() Act("director_status") end)
 		Button(panel, L("act.director_clear"), dark, function() Act("director_clear") end)
@@ -838,6 +853,51 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 
 					rows[#rows + 1] = header
 
+					-- Whitelist in two clicks: everything off, then tick the
+					-- few that should stay.
+					local bar = vgui.Create("DPanel", panel)
+
+					bar:Dock(TOP)
+					bar:SetTall(22)
+					bar:DockMargin(14, 0, 6, 2)
+					bar.Paint = function() end
+					bar.IsHeader = true
+
+					local function setAll(on)
+						for _, it in ipairs(list) do
+							local cls = tostring(it.class)
+
+							if (not banned[cls]) ~= on then
+								banned[cls] = (not on) or nil
+
+								Act("kit_ban", nil, util.TableToJSON({ name = cls, off = not on }))
+							end
+						end
+
+						for _, r in ipairs(rows) do
+							if IsValid(r) and r.Category == id then
+								r.Updating = true
+								r:SetValue(on)
+								r.Updating = nil
+							end
+						end
+					end
+
+					for i, on in ipairs({ true, false }) do
+						local b = vgui.Create("DButton", bar)
+
+						b:SetText(L(on and "ban.all_on" or "ban.all_off"))
+						b:Dock(LEFT)
+						b:SetWide(150)
+						b:DockMargin(0, 0, 4, 0)
+						b.DoClick = function() if isAdmin then setAll(on) end end
+
+						Flat(b, DARK.row, DARK.accent)
+						Paint(b, true)
+					end
+
+					rows[#rows + 1] = bar
+
 					for _, item in ipairs(list) do
 						local class = tostring(item.class)
 						local box = vgui.Create("DCheckBoxLabel", panel)
@@ -847,6 +907,7 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 						box:Dock(TOP)
 						box:DockMargin(14, 1, 6, 1)
 						box.Class = class
+						box.Category = id
 						box.Search = string.lower(class .. " " .. tostring(item.name))
 
 						Paint(box, true)
@@ -888,6 +949,311 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 
 		refresh()
 		RequestValues()
+	end
+--//
+
+--\\ Bot models
+	--[[
+		What a bot may wear: Z-City's own appearance models first, then
+		every player model installed (the same list the server accepts -
+		sv_bot_models.lua refuses anything else).
+	]]
+	local function ModelList()
+		local out, seen = {}, {}
+		local ap = hg.Appearance and hg.Appearance.PlayerModels
+
+		if istable(ap) then
+			for sex = 1, 2 do
+				for name, tbl in SortedPairs(ap[sex] or {}) do
+					if istable(tbl) and isstring(tbl.mdl) and not seen[string.lower(tbl.mdl)] then
+						seen[string.lower(tbl.mdl)] = true
+						out[#out + 1] = { name = "Z-City: " .. name, mdl = tbl.mdl }
+					end
+				end
+			end
+		end
+
+		for name, mdl in SortedPairs(player_manager.AllValidModels()) do
+			if isstring(mdl) and not seen[string.lower(mdl)] then
+				seen[string.lower(mdl)] = true
+				out[#out + 1] = { name = name, mdl = mdl }
+			end
+		end
+
+		return out
+	end
+
+	local GRID_LIMIT = 400
+
+	--- Filter box + a grid of model icons.
+	-- opts.click(mdl), opts.rightClick(mdl), opts.marked(mdl) -> bool
+	local function ModelGrid(parent, opts)
+		local filter = vgui.Create("DTextEntry", parent)
+
+		filter:Dock(TOP)
+		filter:DockMargin(4, 4, 4, 4)
+		filter:SetPlaceholderText(L("models.filter"))
+		filter:SetUpdateOnType(true)
+
+		local grid = vgui.Create("DIconLayout", parent)
+
+		grid:Dock(TOP)
+		grid:DockMargin(4, 0, 4, 4)
+		grid:SetSpaceX(4)
+		grid:SetSpaceY(4)
+
+		local all = ModelList()
+
+		local function fill()
+			grid:Clear()
+
+			local q = string.lower(string.Trim(filter:GetValue() or ""))
+			local shown = 0
+
+			for _, item in ipairs(all) do
+				if q == "" or string.find(string.lower(item.name .. " " .. item.mdl), q, 1, true) then
+					shown = shown + 1
+
+					if shown > GRID_LIMIT then break end
+
+					local icon = grid:Add("SpawnIcon")
+
+					icon:SetSize(64, 64)
+					icon:SetModel(item.mdl)
+					icon:SetTooltip(item.name .. "\n" .. item.mdl)
+
+					icon.DoClick = function() if opts.click then opts.click(item.mdl) end end
+					icon.DoRightClick = function() if opts.rightClick then opts.rightClick(item.mdl) end end
+
+					local paintOver = icon.PaintOver
+
+					icon.PaintOver = function(self, w, h)
+						if paintOver then paintOver(self, w, h) end
+
+						if opts.marked and opts.marked(item.mdl) then
+							surface.SetDrawColor(90, 210, 120)
+							surface.DrawOutlinedRect(0, 0, w, h, 3)
+						end
+					end
+				end
+			end
+
+			if shown > GRID_LIMIT then
+				chat.AddText(Color(150, 200, 255), "[hg.bots] ", color_white, string.format(L("models.limit"), GRID_LIMIT))
+			end
+
+			grid:InvalidateLayout(true)
+			parent:InvalidateLayout()
+		end
+
+		filter.OnValueChange = fill
+
+		fill()
+
+		return grid
+	end
+
+	--- The "Bot models" tab: the random pool, plus "put this on every bot".
+	local function BuildModels(panel)
+		local help = vgui.Create("DLabel", panel)
+
+		help:SetText(L("models.help"))
+		help:SetWrap(true)
+		help:SetAutoStretchVertical(true)
+		help:Dock(TOP)
+		help:DockMargin(6, 6, 6, 6)
+
+		Paint(help, true)
+
+		local info = hg.bots.SettingIndex and hg.bots.SettingIndex.hg_bot_model_mode
+		local row = info and BuildRow(panel, "hg_bot_model_mode", info, true)
+
+		Button(panel, L("models.reroll"), true, function() Act("model_reroll") end)
+
+		-- Names: one per line, new bots take theirs from here.
+		local namesLabel = vgui.Create("DLabel", panel)
+
+		namesLabel:SetText(L("names.help"))
+		namesLabel:SetWrap(true)
+		namesLabel:SetAutoStretchVertical(true)
+		namesLabel:Dock(TOP)
+		namesLabel:DockMargin(6, 10, 6, 2)
+
+		Paint(namesLabel, true)
+
+		local namesBox = vgui.Create("DTextEntry", panel)
+
+		namesBox:SetMultiline(true)
+		namesBox:SetTall(110)
+		namesBox:Dock(TOP)
+		namesBox:DockMargin(4, 2, 4, 2)
+		namesBox:SetValue(table.concat(botNames, "\n"))
+
+		Button(panel, L("names.save"), true, function()
+			local list = {}
+
+			for _, line in ipairs(string.Explode("\n", namesBox:GetValue() or "")) do
+				line = string.Trim(line)
+
+				if line ~= "" then list[#list + 1] = line end
+			end
+
+			Act("names_set", nil, util.TableToJSON(list))
+		end)
+
+		ModelGrid(panel, {
+			click = function(mdl)
+				local on = not modelPool[string.lower(mdl)]
+
+				modelPool[string.lower(mdl)] = on or nil
+
+				Act("model_pool", nil, util.TableToJSON({ mdl = mdl, on = on }))
+			end,
+			rightClick = function(mdl)
+				local menu = DermaMenu()
+
+				menu:AddOption(L("models.all"), function() Act("model_all", nil, mdl) end):SetIcon("icon16/group.png")
+				menu:AddOption(L("models.copy"), function() SetClipboardText(mdl) end):SetIcon("icon16/page_copy.png")
+				menu:Open()
+			end,
+			marked = function(mdl) return modelPool[string.lower(mdl)] == true end,
+		})
+
+		local lastNames = botNames
+
+		listeners[panel] = function()
+			if IsValid(row) then
+				if row.Refresh then row:Refresh() end
+				if row.ApplyRights then row:ApplyRights() end
+			end
+
+			-- Fresh list from the server, and nothing typed over it yet.
+			if botNames ~= lastNames and IsValid(namesBox) and not namesBox:HasFocus() then
+				lastNames = botNames
+				namesBox:SetValue(table.concat(botNames, "\n"))
+			end
+		end
+
+		RequestValues()
+	end
+
+	--- The "Voices" tab: which voice packs bots may use.
+	local function BuildVoices(panel)
+		local help = vgui.Create("DLabel", panel)
+
+		help:SetText(L("voices.help"))
+		help:SetWrap(true)
+		help:SetAutoStretchVertical(true)
+		help:Dock(TOP)
+		help:DockMargin(6, 6, 6, 6)
+
+		Paint(help, true)
+
+		Button(panel, L("voices.reload"), true, function() Act("voice_reload") end)
+
+		local rows = {}
+
+		local function rebuild()
+			for _, r in ipairs(rows) do if IsValid(r) then r:Remove() end end
+
+			rows = {}
+
+			for _, pack in ipairs(voicePacks) do
+				local box = vgui.Create("DCheckBoxLabel", panel)
+				local sex = pack.sex == "f" and L("voices.female") or pack.sex == "m" and L("voices.male") or ""
+				local kind = pack.builtin and L("voices.builtin") or ""
+
+				box:SetText(("%s   (%d %s)%s%s"):format(tostring(pack.name), tonumber(pack.lines) or 0, L("voices.lines"),
+					sex ~= "" and ("  " .. sex) or "", kind ~= "" and ("  " .. kind) or ""))
+				box:Dock(TOP)
+				box:DockMargin(10, 2, 6, 2)
+
+				Paint(box, true)
+
+				box.Updating = true
+				box:SetValue(pack.on == true)
+				box.Updating = nil
+				box:SetEnabled(isAdmin)
+
+				box.OnChange = function(self, val)
+					if self.Updating then return end
+
+					Act("voice_pack", nil, util.TableToJSON({ name = pack.name, on = val }))
+				end
+
+				rows[#rows + 1] = box
+			end
+
+			if #voicePacks == 0 then
+				local empty = vgui.Create("DLabel", panel)
+
+				empty:SetText(L("voices.none"))
+				empty:Dock(TOP)
+				empty:DockMargin(10, 6, 6, 6)
+
+				Paint(empty, true)
+
+				rows[#rows + 1] = empty
+			end
+		end
+
+		local shown
+
+		listeners[panel] = function()
+			if shown ~= voicePacks then
+				shown = voicePacks
+				rebuild()
+			end
+		end
+
+		rebuild()
+		shown = voicePacks
+		RequestValues()
+	end
+
+	--- A window to pick one bot's model (from its right-click menu).
+	function hg.bots.OpenModelPicker(bot)
+		if not IsValid(bot) then return end
+
+		local frame = vgui.Create("DFrame")
+
+		frame:SetSize(math.min(ScrW() - 80, 640), math.min(ScrH() - 80, 560))
+		frame:Center()
+		frame:SetTitle(string.format(L("models.pick"), bot:Nick()))
+		frame:MakePopup()
+
+		frame.Paint = function(self, w, h)
+			draw.RoundedBox(6, 0, 0, w, h, DARK.bg)
+		end
+
+		Paint(frame, true)
+
+		local def = vgui.Create("DButton", frame)
+
+		def:SetText(L("models.default"))
+		def:Dock(TOP)
+		def:DockMargin(4, 2, 4, 2)
+		def:SetTall(26)
+		def.DoClick = function()
+			Act("model_set", bot, "")
+			frame:Close()
+		end
+
+		Flat(def, DARK.row, DARK.accent)
+		Paint(def, true)
+
+		local scroll = vgui.Create("DScrollPanel", frame)
+
+		scroll:Dock(FILL)
+
+		ModelGrid(scroll, {
+			click = function(mdl)
+				if IsValid(bot) then Act("model_set", bot, mdl) end
+
+				frame:Close()
+			end,
+			marked = function(mdl) return IsValid(bot) and string.lower(bot:GetModel() or "") == string.lower(mdl) end,
+		})
 	end
 --//
 
@@ -1004,6 +1370,8 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 		end
 
 		NavButton(L("ban.title"), function(p) BuildBlacklist(p) end)
+		NavButton(L("models.title"), function(p) BuildModels(p) end)
+		NavButton(L("voices.title"), function(p) BuildVoices(p) end)
 
 		for _, group in ipairs(hg.bots.SettingGroups or {}) do
 			NavButton(L("group." .. group.id), function(p) BuildGroup(p, group.id, true) end)
@@ -1153,6 +1521,9 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 
 		if not ent then return end
 
+		-- Kits and voice packs for the submenus, fresh for next time.
+		RequestValues()
+
 		local ply = LocalPlayer()
 		local admin = BotEntFor(ent, ply, false)
 		local super = BotEntFor(ent, ply, true)
@@ -1186,6 +1557,8 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 				:SetIcon("icon16/user_red.png")
 			sub:AddOption(L("ctx.faction.guard"), function() Act("faction", ent, "guard") end)
 				:SetIcon("icon16/user_green.png")
+			sub:AddOption(L("ctx.faction.neutral"), function() Act("faction", ent, "neutral") end)
+				:SetIcon("icon16/user_orange.png")
 		end
 
 		-- Gear
@@ -1206,6 +1579,37 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 					sub:AddOption(name, function() Act("kit_apply", ent, name) end)
 						:SetIcon("icon16/box.png")
 				end
+			end
+		end
+
+		-- Model (sv_bot_models.lua)
+		if admin then
+			local msub, mparent = menu:AddSubMenu(L("ctx.model"))
+
+			mparent:SetIcon("icon16/user_suit.png")
+
+			msub:AddOption(L("ctx.model.pick"), function() hg.bots.OpenModelPicker(ent) end)
+				:SetIcon("icon16/application_view_icons.png")
+			msub:AddOption(L("models.default"), function() Act("model_set", ent, "") end)
+				:SetIcon("icon16/arrow_undo.png")
+
+			menu:AddOption(L("ctx.rename"), function()
+				Derma_StringRequest(L("ctx.rename"), L("ctx.rename.help"), ent:GetNWString("PlayerName", ent:Nick()),
+					function(text) if IsValid(ent) then Act("name_set", ent, text) end end)
+			end):SetIcon("icon16/textfield_rename.png")
+
+			-- Voice pack (sv_bot_voice.lua).
+			local vsub, vparent = menu:AddSubMenu(L("ctx.voice"))
+
+			vparent:SetIcon("icon16/sound.png")
+
+			vsub:AddOption(L("ctx.voice.auto"), function() Act("voice_set", ent, "") end):SetIcon("icon16/arrow_refresh.png")
+
+			if #voicePacks > 0 then vsub:AddSpacer() end
+
+			for _, pack in ipairs(voicePacks) do
+				vsub:AddOption(tostring(pack.name), function() Act("voice_set", ent, tostring(pack.name)) end)
+					:SetIcon(pack.on and "icon16/sound.png" or "icon16/sound_mute.png")
 			end
 		end
 
@@ -1311,7 +1715,9 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 					if screen.visible then
 						local faction = ply:GetNWString("hg_bot_faction", "raider")
 						local state = ply:GetNWString("hg_bot_state", "?")
-						local col = faction == "guard" and Color(120, 220, 140) or Color(240, 150, 150)
+						local col = faction == "guard" and Color(120, 220, 140)
+							or faction == "neutral" and Color(235, 215, 120)
+							or Color(240, 150, 150)
 
 						draw.SimpleTextOutlined(ply:Nick(), "DermaDefault", screen.x, screen.y, col,
 							TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER, 1, color_black)

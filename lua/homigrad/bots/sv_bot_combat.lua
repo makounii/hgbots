@@ -771,6 +771,24 @@ local hg_bot_strafe_dist_max = CreateConVar("hg_bot_strafe_dist_max", "320", {FC
 		data.LookPos = from + Vector(0, 0, 56)
 		ResetSeek(data)
 
+		-- The cover still hides us from where the shots come from, and we
+		-- are there or getting there: keep it. (A fresh random cover point
+		-- every 2.5 s had the bot zig-zagging between spots under fire.)
+		local cover = data.UnderFireCover
+
+		if cover and now > (data.UnderFireRepick or 0) then
+			if data.UnderFireCoverRef ~= cover then data.UnderFireCoverRef, data.UnderFireCoverDist = cover, nil end
+
+			local d = bot:GetPos():Distance(cover)
+			local nearer = d < 48 or (data.Path and (data.UnderFireCoverDist == nil or d < data.UnderFireCoverDist - 16))
+
+			data.UnderFireCoverDist = d
+
+			if nearer and util.TraceLine({ start = cover + Vector(0, 0, 40), endpos = from + Vector(0, 0, 60), mask = MASK_VISIBLE }).Hit then
+				data.UnderFireRepick = now + 0.5
+			end
+		end
+
 		if not data.UnderFireCover or now > (data.UnderFireRepick or 0) then
 			data.UnderFireRepick = now + 2.5
 

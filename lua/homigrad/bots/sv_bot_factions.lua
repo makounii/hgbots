@@ -11,6 +11,17 @@
 	     grudge like any bot does (sv_bot_perception.lua's trust grudge).
 	   Raiders and guards are enemies both ways, so the player can have
 	   allies that actually fight for them.
+	   - "neutral": starts no fight with anyone - players, raiders or
+	     guards - and nobody starts one with it. Whoever attacks it is
+	     fought back (for hg_bot_neutral_memory seconds, or for good if a
+	     player did it), and other neutrals nearby join in.
+
+	   The faction lives on the bot ENTITY, not only in its AI table:
+	   hg.bots.Init rebuilds that table (a re-init from the menu, a new
+	   life) and used to drop it, which is how a guard came back from a
+	   ragdoll as a raider - and why "spawn a friendly bot" sometimes
+	   gave a hostile one (the faction was set a moment after spawning,
+	   and an Init that came later wiped it).
 
 	2. NPC / NEXTBOT TARGETS. Perception only ever looked at
 	   player.GetHumans(), so bots walked past npc_z, zombies and any other
@@ -36,8 +47,10 @@ local hg_bot_npc          = CreateConVar("hg_bot_npc",          "1", {FCVAR_ARCH
 local hg_bot_npc_range    = CreateConVar("hg_bot_npc_range",    "3000", {FCVAR_ARCHIVE}, "How far around a bot NPCs are collected as possible targets", 200, 10000)
 local hg_bot_npc_friendly = CreateConVar("hg_bot_npc_friendly", "", {FCVAR_ARCHIVE}, "Comma separated NPC classes bots never attack")
 local hg_bot_guard_follow = CreateConVar("hg_bot_guard_follow", "600", {FCVAR_ARCHIVE}, "How closely a guard bot sticks to the player it escorts (0 = it doesn't escort anyone)", 0, 4000)
+local hg_bot_neutral_memory = CreateConVar("hg_bot_neutral_memory", "120", {FCVAR_ARCHIVE}, "Seconds a neutral bot keeps fighting a bot that attacked it (a player who attacks one is never forgiven)", 10, 1800)
+local hg_bot_neutral_help = CreateConVar("hg_bot_neutral_help", "1200", {FCVAR_ARCHIVE}, "Neutral bots within this distance of an attacked neutral fight the attacker too (0 = each on its own)", 0, 5000)
 
-hg.bots.Factions = { raider = true, guard = true }
+hg.bots.Factions = { raider = true, guard = true, neutral = true }
 
 --\\ Faction of a bot
 	function hg.bots.GetFaction(bot)
@@ -45,16 +58,21 @@ hg.bots.Factions = { raider = true, guard = true }
 
 		local data = bot.Bot
 
-		return (data and data.Faction) or "raider"
+		return (data and data.Faction) or bot.hgBotFaction or "raider"
 	end
 
-	--- @param faction "raider" | "guard"
+	--- Works before the bot has its AI table too (straight after
+	-- hg.bots.Spawn): hg.bots.Init picks the faction up from the entity.
+	-- @param faction "raider" | "guard" | "neutral"
 	function hg.bots.SetFaction(bot, faction)
 		if not IsValid(bot) or not hg.bots.Factions[faction] then return false end
 
+		bot.hgBotFaction = faction
+		bot:SetNWString("hg_bot_faction", faction)
+
 		local data = bot.Bot
 
-		if not data then return false end
+		if not data then return true end
 
 		data.Faction = faction
 
@@ -65,9 +83,8 @@ hg.bots.Factions = { raider = true, guard = true }
 			mem.Target = nil
 			mem.TargetPos = nil
 			mem.Grudge = nil
+			mem.Attackers = nil
 		end
-
-		bot:SetNWString("hg_bot_faction", faction)
 
 		return true
 	end
@@ -220,20 +237,68 @@ hg.bots.Factions = { raider = true, guard = true }
 			return nil
 		end
 
-		-- Bot versus bot: different factions fight, same faction never does.
+		local faction = hg.bots.GetFaction(bot)
+
+		-- Bot versus bot: different factions fight, same faction never does
+		-- - except that nobody picks a fight with a neutral, and a neutral
+		-- picks none.
 		if ent.IsHomigradBot then
-			return hg.bots.GetFaction(ent) ~= hg.bots.GetFaction(bot)
+			local other = hg.bots.GetFaction(ent)
+
+			if other == faction then return false end
+			if faction == "neutral" or other == "neutral" then return hg.bots.Provoked(bot, ent) end
+
+			return true
 		end
 
 		-- A guard leaves players alone unless one of them shot it.
-		if hg.bots.GetFaction(bot) == "guard" then
+		if faction == "guard" then
 			local mem = bot.Bot and bot.Bot.Memory
 
 			return (mem and mem.Grudge and mem.Grudge[ent]) and true or false
 		end
 
+		if faction == "neutral" then return hg.bots.Provoked(bot, ent) end
+
 		return nil -- raider versus player: the trust logic decides
 	end
+
+	--- Did ent attack this bot (recently, or ever for a player)?
+	function hg.bots.Provoked(bot, ent)
+		local mem = bot.Bot and bot.Bot.Memory
+
+		if not mem then return false end
+		if mem.Grudge and mem.Grudge[ent] then return true end
+
+		local at = mem.Attackers and mem.Attackers[ent]
+
+		return at ~= nil and CurTime() - at < hg_bot_neutral_memory:GetFloat()
+	end
+
+	-- Attack one neutral and the neutrals around it answer: they get the
+	-- attacker on their own list, as if they had been shot themselves.
+	hook.Add("HG_BotThreatened", "HG_Bots_NeutralHelp", function(bot, attacker)
+		if not hg_bot_factions:GetBool() then return end
+		if not IsValid(bot) or not IsValid(attacker) or hg.bots.GetFaction(bot) ~= "neutral" then return end
+
+		local radius = hg_bot_neutral_help:GetFloat()
+
+		if radius <= 0 then return end
+
+		local now = CurTime()
+		local pos = bot:GetPos()
+
+		for other in pairs(hg.bots.List) do
+			local mem = other ~= bot and IsValid(other) and other:Alive() and other.Bot and other.Bot.Memory
+
+			if mem and hg.bots.GetFaction(other) == "neutral" and other ~= attacker
+				and other:GetPos():DistToSqr(pos) < radius * radius
+			then
+				mem.Attackers = mem.Attackers or {}
+				mem.Attackers[attacker] = now
+			end
+		end
+	end)
 
 	--- Adds everything besides the human players to perception's candidate
 	-- list: other bots (factions sort out who fights whom) and NPCs.
@@ -334,9 +399,7 @@ hg.bots.Factions = { raider = true, guard = true }
 	hook.Add("HG_BotInitialized", "HG_Bots_FactionDefault", function(bot)
 		if not IsValid(bot) then return end
 
-		local data = bot.Bot
-
-		bot:SetNWString("hg_bot_faction", (data and data.Faction) or "raider")
+		bot:SetNWString("hg_bot_faction", hg.bots.GetFaction(bot) or "raider")
 	end)
 --//
 
@@ -356,11 +419,9 @@ hg.bots.Factions = { raider = true, guard = true }
 
 		if not IsValid(bot) then return end
 
-		-- The faction is set once the bot has its Bot table (Init runs two
-		-- ticks after the spawn).
-		timer.Simple(0.2, function()
-			if IsValid(bot) then hg.bots.SetFaction(bot, "guard") end
-		end)
+		-- Straight away, on the entity: Init (two ticks later) takes it
+		-- from there. A timer here used to race the Init and lose.
+		hg.bots.SetFaction(bot, "guard")
 	end, nil, "Spawn a bot friendly to players: hg_bot_spawn_guard [kit name]")
 
 	--- One command that answers "why is this bot ignoring me?". Prints
@@ -485,7 +546,7 @@ hg.bots.Factions = { raider = true, guard = true }
 		local faction = args and args[1]
 
 		if not hg.bots.Factions[faction] then
-			print("[hg.bots] usage: hg_bot_faction <raider|guard> - applies to the bot you are looking at, or all bots with 'all'")
+			print("[hg.bots] usage: hg_bot_faction <raider|guard|neutral> - applies to the bot you are looking at, or all bots with 'all'")
 			return
 		end
 
@@ -504,5 +565,5 @@ hg.bots.Factions = { raider = true, guard = true }
 		if IsValid(ent) and ent.IsHomigradBot and hg.bots.SetFaction(ent, faction) then
 			print("[hg.bots] " .. ent:Nick() .. " is now " .. faction)
 		end
-	end, nil, "Set a bot's faction: hg_bot_faction <raider|guard> [all]")
+	end, nil, "Set a bot's faction: hg_bot_faction <raider|guard|neutral> [all]")
 --//

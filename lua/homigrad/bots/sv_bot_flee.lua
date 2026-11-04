@@ -20,12 +20,13 @@
 	would flicker between combat and flee state every Think tick, which
 	looks broken rather than indecisive-but-committed.
 
+	Also here: a route that can't be found is tried other ways round, and a
+	bot with no way left is cornered and fights (FleeOtherWay); a good route
+	is kept instead of re-rolled every pick (KeepFleeGoal). Whether to run
+	at all is put to sv_bot_nerve.lua's reckoning of the fight.
+
 	Deliberately NOT modeled here: panic-fire while retreating (a fleeing
-	bot doesn't shoot back at all right now), taking cover instead of just
-	running in a straight line away, and giving up on fleeing early if
-	cornered with no viable path (SetGoal's existing "no navmesh/no route"
-	fallback just goes in a straight line regardless, which can end at a
-	wall). All reasonable next steps, not part of this pass.
+	bot doesn't shoot back at all right now).
 ]]
 
 hg.bots = hg.bots or {}
@@ -45,6 +46,8 @@ local hg_bot_laststand       = CreateConVar("hg_bot_laststand",       "1",    {F
 local hg_bot_laststand_blood = CreateConVar("hg_bot_laststand_blood", "3300", {FCVAR_ARCHIVE}, "Blood (of 5000) below which a bot is too weak to run away", 2000, 5000)
 local hg_bot_laststand_shock = CreateConVar("hg_bot_laststand_shock", "30",   {FCVAR_ARCHIVE}, "Pain shock above which a bot can't run away (Z-City knocks out at 40)", 5, 100)
 local hg_bot_flee_turnback   = CreateConVar("hg_bot_flee_turnback",   "450",  {FCVAR_ARCHIVE}, "An armed bot never turns its back on a visible enemy this close - it shoots instead", 0, 2000)
+local hg_bot_flee_keep       = CreateConVar("hg_bot_flee_keep",       "1",    {FCVAR_ARCHIVE}, "A fleeing bot keeps its route while the cover it runs to is still out of the threat's sight and it is getting nearer, instead of drawing a new one every repick", 0, 1)
+local hg_bot_flee_ways       = CreateConVar("hg_bot_flee_ways",       "1",    {FCVAR_ARCHIVE}, "When no escape route away from the threat can be found, try other directions round; with none left the bot is cornered and fights", 0, 1)
 local hg_bot_flee_scavenge   = CreateConVar("hg_bot_flee_scavenge",   "700",  {FCVAR_ARCHIVE}, "A bot running with nothing to fight with grabs guns and ammo within this distance on the way (0 = off)", 0, 2000)
 
 --\\ Last stand
@@ -110,7 +113,7 @@ local hg_bot_flee_scavenge   = CreateConVar("hg_bot_flee_scavenge",   "700",  {F
 	-- fresh) once health recovers comfortably above the threshold - a
 	-- small hysteresis gap, not the exact same value, so healing across
 	-- the threshold by one point doesn't immediately re-arm the roll.
-	function hg.bots.ShouldFlee(bot)
+	local function FleeRoll(bot)
 		if not IsValid(bot) or not bot.Bot then return false end
 
 		local data = bot.Bot
@@ -177,6 +180,17 @@ local hg_bot_flee_scavenge   = CreateConVar("hg_bot_flee_scavenge",   "700",  {F
 		end
 
 		return data.FleeCommitted
+	end
+
+	--- The roll above says run: the reckoning of the fight (sv_bot_nerve.lua)
+	-- has the last word - a coin at 30 % health is no reason to leave a fight
+	-- that is going your way.
+	function hg.bots.ShouldFlee(bot)
+		if not FleeRoll(bot) then return false end
+
+		if hg.bots.NerveOn and hg.bots.NerveOn() and hg.bots.NerveVerdict(bot) == "stand" then return false end
+
+		return true
 	end
 
 	-- Fired by sv_bot_perception.lua whenever a bot gets a fresh, confirmed
@@ -276,6 +290,89 @@ local hg_bot_flee_scavenge   = CreateConVar("hg_bot_flee_scavenge",   "700",  {F
 		return true
 	end
 
+	local CHEST, EYE = Vector(0, 0, 40), Vector(0, 0, 60)
+	local OTHER_WAYS = { 45, -45, 90, -90, 135, -135, 25, -25 }
+
+	--- Is the route the bot is on worth keeping past the repick? A cover
+	-- point still out of the threat's sight, or a way out found by
+	-- FleeOtherWay - while the bot is getting nearer to it. (Every repick
+	-- drew a fresh random cover point, so the route changed every 1.5 s and
+	-- the bot zig-zagged between spots.)
+	local function KeepFleeGoal(bot, data, threatPos)
+		if not hg_bot_flee_keep:GetBool() then return false end
+
+		local goal = data.Goal
+
+		if data.FleeGoalRef ~= goal then
+			data.FleeGoalRef, data.FleeGoalDist = goal, nil
+		end
+
+		local alt = data.FleeAltGoal and goal:DistToSqr(data.FleeAltGoal) < 1
+		local hidden = alt or util.TraceLine({ start = goal + CHEST, endpos = threatPos + EYE, mask = MASK_VISIBLE }).Hit
+
+		if not hidden then return false end
+
+		local d = bot:GetPos():Distance(goal)
+		local last = data.FleeGoalDist
+
+		data.FleeGoalDist = d
+
+		return last == nil or d < last - 16
+	end
+
+	--- Nowhere left to run: a cornered man fights (with his fists if that
+	-- is all he has), and is not sent running again for a few seconds
+	-- (ChooseReaction reads data.CorneredUntil).
+	local function Cornered(bot, data, threatPos)
+		local now = CurTime()
+
+		data.CorneredUntil = now + 6
+		data.LastStandUntil = now + 6
+		data.FleeCommitted = false
+		data.FleeTries = nil
+
+		local target = data.Memory.Target
+
+		if IsValid(target) and target:Alive() then
+			hg.bots.SetState(bot, "combat")
+		elseif hg.bots.HoldPosition then
+			hg.bots.HoldPosition(bot, bot:GetPos(), threatPos)
+		end
+	end
+
+	--- The escape route was refused (the spot "away" off the navmesh,
+	-- behind a wall, across deep water): the bot used to stand where it was,
+	-- in the open, until the next pick asked for the same direction again.
+	-- Try the next ways round instead, one per call, then nearer; with none
+	-- left it is cornered.
+	local function FleeOtherWay(bot, data, threatPos, now)
+		if not hg_bot_flee_ways:GetBool() then return end
+		if (data.PathFailUntil or 0) <= now or now < (data.FleeTryAt or 0) then return end -- (only after a refusal)
+
+		data.FleeTryAt = now + 0.3
+		data.FleeTries = (data.FleeTries or 0) + 1
+
+		local turn = OTHER_WAYS[data.FleeTries]
+
+		if not turn then return Cornered(bot, data, threatPos) end
+
+		local away = bot:GetPos() - threatPos
+		away.z = 0
+
+		if away:LengthSqr() < 1 then away = Vector(math.Rand(-1, 1), math.Rand(-1, 1), 0) end
+
+		away:Normalize()
+		away:Rotate(Angle(0, turn, 0))
+
+		local dest = bot:GetPos() + away * (data.FleeTries <= 6 and 450 or 260)
+
+		-- (true with no route yet when the search waits for its turn)
+		if hg.bots.SetGoal(bot, dest, { avoidPos = threatPos, avoidRadius = 800, avoidWeight = 3, force = true }) then
+			data.FleeAltGoal = data.PendingGoal or data.Goal
+			data.NextFleePick = now + 0.5
+		end
+	end
+
 	hg.bots.RegisterState("flee", {
 		Enter = function(bot, data)
 			data.Attacking = false
@@ -305,6 +402,9 @@ local hg_bot_flee_scavenge   = CreateConVar("hg_bot_flee_scavenge",   "700",  {F
 
 		Think = function(bot, data)
 			data.NextStateThink = CurTime() + 0.15
+
+			-- Run down, or the odds came back (sv_bot_nerve.lua): turn and fight.
+			if hg.bots.NerveFleeCheck and hg.bots.NerveFleeCheck(bot, data) then return end
 
 			local mem = data.Memory
 			-- Deliberately mem.TargetPos only, never a live
@@ -398,6 +498,12 @@ local hg_bot_flee_scavenge   = CreateConVar("hg_bot_flee_scavenge",   "700",  {F
 			-- was a real server-frame cost with several fleeing bots.
 			local pathDone = not data.Path and not data.PendingGoal
 
+			-- A route still worth it is kept past the pick (looked at again
+			-- twice a second).
+			if not pathDone and data.Goal and now >= (data.NextFleePick or 0) and KeepFleeGoal(bot, data, threatPos) then
+				data.NextFleePick = now + 0.5
+			end
+
 			if CurTime() >= (data.NextFleePick or 0) or (pathDone and CurTime() >= (data.LastFleePick or 0) + 0.5) then
 				data.LastFleePick = CurTime()
 				data.NextFleePick = CurTime() + hg_bot_flee_recheck:GetFloat()
@@ -439,6 +545,12 @@ local hg_bot_flee_scavenge   = CreateConVar("hg_bot_flee_scavenge",   "700",  {F
 			end
 
 			hg.bots.FollowPath(bot, data)
+
+			if data.Path or data.PendingGoal then
+				data.FleeTries = nil
+			else
+				FleeOtherWay(bot, data, threatPos, now)
+			end
 		end,
 	})
 --//

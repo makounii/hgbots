@@ -533,9 +533,7 @@ local hg_bot_dir_debug      = CreateConVar("hg_bot_director_debug",   "0",  {FCV
 
 		-- A share of them can be on the players' side (sv_bot_factions.lua).
 		if hg.bots.SetFaction and math.random() < hg_bot_dir_guards:GetFloat() then
-			timer.Simple(0.25, function()
-				if IsValid(bot) then hg.bots.SetFaction(bot, "guard") end
-			end)
+			hg.bots.SetFaction(bot, "guard")
 		end
 
 		if hg_bot_dir_debug:GetBool() then
@@ -570,8 +568,35 @@ local hg_bot_dir_debug      = CreateConVar("hg_bot_director_debug",   "0",  {FCV
 		return #ents.FindByClass("ent_hg_director") > 0
 	end
 
+	--- A clean slate, for when the director is switched (back) on: no
+	-- leftover phase timer, spawn clock, pressure or old error from the
+	-- previous run. Without it a director switched off and on again could
+	-- sit in whatever it was doing when it was stopped.
+	local function ResetState()
+		local now = CurTime()
+
+		state.phase = "idle"
+		state.phaseSince = now - 20 -- straight into the build-up
+		state.pressure = 0
+		state.lastSpawn = 0
+		state.lastFight = 0
+		state.lastReason = nil
+	end
+
+	local wasRunning = false
+
 	local function Tick()
-		if not Running() then
+		local running = Running()
+
+		if running ~= wasRunning then
+			wasRunning = running
+
+			if running then ResetState() end
+
+			print("[hg.bots] director: " .. (running and "started" or "stopped"))
+		end
+
+		if not running then
 			if state.phase ~= "idle" then SetPhase("idle") end
 
 			return
@@ -634,8 +659,9 @@ local hg_bot_dir_debug      = CreateConVar("hg_bot_director_debug",   "0",  {FCV
 			if IsValid(ply) then ply:PrintMessage(HUD_PRINTCONSOLE, line) end
 		end
 
-		say(("[hg.bots] director: %s, phase %s for %.0f s, pressure %.2f"):format(
-			Running() and "running" or "off", state.phase, CurTime() - state.phaseSince, state.pressure))
+		say(("[hg.bots] director: %s (switch %s, entities %d), phase %s for %.0f s, pressure %.2f"):format(
+			Running() and "running" or "off", hg_bot_director:GetBool() and "on" or "off",
+			#ents.FindByClass("ent_hg_director"), state.phase, CurTime() - state.phaseSince, state.pressure))
 		say(("  difficulty %d, its bots alive %d, cap %d, spawned in total %d, player spread %.0f u"):format(
 			hg_bot_dir_difficulty:GetInt(), hg.bots.DirectorAlive(), hg_bot_dir_max:GetInt(), state.spawned, state.spread or 0))
 		say(("  slots %d/%d, navmesh %s, wants %d bots now"):format(
@@ -658,52 +684,50 @@ local hg_bot_dir_debug      = CreateConVar("hg_bot_director_debug",   "0",  {FCV
 	end, nil, "Remove every bot the director spawned")
 --//
 
---\\ The entity
-	-- Spawnable from the Q menu (Entities -> Tarkov AI). While one exists
-	-- the director runs; removing it stops the spawning without touching
-	-- the bots already in the world.
-	local ENT = {}
+--\\ The entity, and switching it on and off
+	-- The entity itself is defined in sh_bot_director_ent.lua: it has to
+	-- exist on the client too. Registered here on the server only, a
+	-- client that saw one placed printed "Error creating 'ent_hg_director'
+	-- (Make sure the file is AddCSLuaFile'd...)".
 
-	ENT.Type = "anim"
-	ENT.Base = "base_gmodentity"
-	ENT.PrintName = "Tarkov AI Director"
-	ENT.Author = "hg.bots"
-	ENT.Category = "Tarkov AI"
-	ENT.Spawnable = true
-	ENT.AdminOnly = true
-	ENT.Model = "models/hunter/blocks/cube025x025x025.mdl"
+	--- On: the convar (an entity isn't needed). Off: the convar AND every
+	-- director entity - with one left in the world the director kept
+	-- running whatever the switch said.
+	function hg.bots.DirectorSetEnabled(on)
+		local cvar = GetConVar("hg_bot_director")
 
-	function ENT:Initialize()
-		if SERVER then
-			self:SetModel(self.Model)
-			self:PhysicsInit(SOLID_VPHYSICS)
-			self:SetMoveType(MOVETYPE_VPHYSICS)
-			self:SetSolid(SOLID_VPHYSICS)
-			self:DrawShadow(false)
+		if cvar then cvar:SetBool(on) end
 
-			local phys = self:GetPhysicsObject()
-
-			if IsValid(phys) then phys:Wake() end
-
-			print("[hg.bots] director entity placed - the director is now running (hg_bot_director_status)")
+		if not on then
+			for _, ent in ipairs(ents.FindByClass("ent_hg_director")) do ent:Remove() end
 		end
+
+		if hg.bots.SaveSettings then hg.bots.SaveSettings() end
 	end
 
-	function ENT:OnRemove()
-		if SERVER then print("[hg.bots] director entity removed") end
-	end
+	concommand.Add("hg_bot_director_on", function(ply)
+		if IsValid(ply) and not ply:IsSuperAdmin() then return end
 
-	scripted_ents.Register(ENT, "ent_hg_director")
+		hg.bots.DirectorSetEnabled(true)
+	end, nil, "Start the AI director")
 
-	-- The Q menu entry needs the entity registered on the client too, and
-	-- this addon's files are server side, so here is the console way in.
+	concommand.Add("hg_bot_director_off", function(ply)
+		if IsValid(ply) and not ply:IsSuperAdmin() then return end
+
+		hg.bots.DirectorSetEnabled(false)
+	end, nil, "Stop the AI director (removes the director entities too)")
+
 	concommand.Add("hg_bot_director_place", function(ply)
 		if IsValid(ply) and not ply:IsSuperAdmin() then return end
 
 		local pos = IsValid(ply) and ply:GetEyeTrace().HitPos + Vector(0, 0, 8) or Vector(0, 0, 0)
 		local ent = ents.Create("ent_hg_director")
 
-		if not IsValid(ent) then return end
+		if not IsValid(ent) then
+			print("[hg.bots] director: could not create ent_hg_director - is sh_bot_director_ent.lua loaded?")
+
+			return
+		end
 
 		ent:SetPos(pos)
 		ent:Spawn()

@@ -106,6 +106,8 @@ local hg_bot_damage_alert     = CreateConVar("hg_bot_damage_alert",     "1.0",  
 local hg_bot_suppression_gain = CreateConVar("hg_bot_suppression_gain", "0.25", {FCVAR_ARCHIVE}, "Suppression added per near miss", 0, 1)
 local hg_bot_suppression_decay = CreateConVar("hg_bot_suppression_decay", "0.3", {FCVAR_ARCHIVE}, "Suppression lost per second", 0, 5)
 local hg_bot_target_forget_time = CreateConVar("hg_bot_target_forget_time", "12.0", {FCVAR_ARCHIVE}, "Seconds since a target was last seen or heard before a bot forgets it - independent of Alertness, which decays much faster", 1, 120)
+local hg_bot_sight_attention  = CreateConVar("hg_bot_sight_attention",  "1",    {FCVAR_ARCHIVE}, "Detection is quicker for what a bot looks straight at, and at the edge of its eye goes by movement (a still body slower, a running one quicker and further out)", 0, 1)
+local hg_bot_voice_radius     = CreateConVar("hg_bot_voice_radius",     "900",  {FCVAR_ARCHIVE}, "How far bots hear a player talking in chat (whisper x0.3, yell or capitals x2; 0 = not at all)", 0, 6000)
 
 -- Trust mode. Off (default, NOT archived so every server start is wild):
 -- bots attack any human they register. On: bots only attack humans who
@@ -387,6 +389,7 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 		local dot = fwd:Dot(dir)
 
 		local central = dot >= math.cos(math.rad(hg_bot_sight_fov:GetFloat() * 0.5))
+		local edge = false
 
 		if not central then
 			-- Peripheral vision: wider cone, much shorter reach. Up close
@@ -396,8 +399,19 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 				return false
 			end
 
-			if dist > baseRange * hg_bot_peripheral_range:GetFloat() then
-				return false
+			local reach = hg_bot_peripheral_range:GetFloat()
+
+			if dist > baseRange * reach then
+				-- ...except for movement: the edge of the eye catches a body
+				-- on the move a good deal further out (to 75 % of the range
+				-- for a run), only it makes out less of it.
+				local speed = hg_bot_sight_attention:GetBool() and char:GetVelocity():Length2D() or 0
+
+				if speed < 60 or dist > baseRange * Lerp(math.Clamp((speed - 60) / 220, 0, 1), reach + 0.1, 0.75) then
+					return false
+				end
+
+				edge = true
 			end
 		end
 
@@ -422,8 +436,9 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 		if visibleCount == 0 then return false end
 
 		return true, {
-			frac = visibleCount / #points,
+			frac = visibleCount / #points * (edge and 0.6 or 1),
 			central = central,
+			edge = edge,
 			point = bestPoint,
 			dist = dist,
 		}
@@ -666,7 +681,11 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 					mem.LastHeard = now
 					mem.TargetVel = nil -- the old velocity no longer matches this position
 				end
-			elseif not IsValid(mem.Target) then
+			elseif not IsValid(mem.Target) and not (kind ~= "gunfire" and IsValid(source) and mem.Spot
+				and (mem.Spot[source] or 0) >= 1 and not hg.bots.IsHostile(source, bot) and hg.bots.CanSee(bot, source))
+			then
+				-- (Not someone it is looking at and knows to be harmless:
+				-- heard, but nothing to go and investigate.)
 				local score = strength * weight
 				local current = (mem.SuspicionStrength or 0) - (now - (mem.SuspicionTime or now)) * 0.1
 
@@ -717,8 +736,12 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 		hg.bots.ReportNoise(data.Pos or ent:GetPos(), radius, owner, "generic")
 	end)
 
-	hook.Add("PlayerFootstep", "HG_Bots_FootstepNoise", function(ply, pos)
-		if not ply:Alive() then return end
+	-- Footsteps come from Z-City's own step hook: its PlayerFootstep hook
+	-- returns true, which (hook order being what it is) could stop ours from
+	-- ever running - bots were deaf to steps. HG_PlayerFootstep_Notify runs
+	-- once per real step, at the walking pace.
+	hook.Add("HG_PlayerFootstep_Notify", "HG_Bots_FootstepNoise", function(ply, pos)
+		if not IsValid(ply) or not ply:Alive() then return end
 		if ply.IsHomigradBot and not hg.bots.SameFaction then return end
 
 		local radius
@@ -731,7 +754,72 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 			radius = hg_bot_step_radius_walk:GetFloat()
 		end
 
+		-- The kit under a torso armour rattles (Z-City plays it each step).
+		local armor = ply.GetNetVar and ply:GetNetVar("Armor", {})
+		if istable(armor) and armor.torso then radius = radius * 1.25 end
+
 		hg.bots.ReportNoise(pos or ply:GetPos(), radius, ply, "step")
+	end)
+
+	-- Talk is heard. Z-City's chat (and chat add-ons built on it) run
+	-- HG_PlayerSay with the speaker and the line as typed. (Its PostPlayerSay
+	-- is no use: it hands on two undefined variables.)
+	local NOT_SPOKEN = { "//", ".//", "[[", "/ooc", "/looc", "/me", "/it", "/roll" } -- out of character, acted
+
+	local function Starts(s, p) return string.sub(s, 1, #p) == p end
+
+	--- Mostly capitals (Latin or Cyrillic): yelled.
+	local function Shouted(text)
+		local up, low = 0, 0
+
+		pcall(function()
+			for _, c in utf8.codes(text) do
+				if (c >= 65 and c <= 90) or (c >= 0x410 and c <= 0x42F) or c == 0x401 then
+					up = up + 1
+				elseif (c >= 97 and c <= 122) or (c >= 0x430 and c <= 0x44F) or c == 0x451 then
+					low = low + 1
+				end
+			end
+		end)
+
+		return up >= 3 and up > low * 2
+	end
+
+	hook.Add("HG_PlayerSay", "HG_Bots_Speech", function(ply, txtTbl, raw)
+		if hg_bot_voice_radius:GetFloat() <= 0 then return end
+		if not IsValid(ply) or not ply:Alive() or ply.IsHomigradBot then return end
+		if ply.organism and ply.organism.otrub then return end
+
+		raw = string.Trim(tostring(raw or ""))
+
+		local low = string.lower(raw)
+
+		for _, p in ipairs(NOT_SPOKEN) do
+			if Starts(low, p) then return end
+		end
+
+		if Starts(low, "!") then return end -- a command
+
+		local mult = 1
+
+		if ply.ChatWhisper or Starts(low, "/w ") or Starts(low, "/whisper") then
+			mult = 0.3
+		elseif Starts(low, "/y ") or Starts(low, "/yell") then
+			mult = 2
+		elseif Starts(low, "/") then
+			return -- a command
+		elseif Shouted(raw) then
+			mult = 2
+		end
+
+		-- After every other HG_PlayerSay hook: a command or a muted line
+		-- is left empty by them.
+		timer.Simple(0, function()
+			if not IsValid(ply) or not ply:Alive() or not istable(txtTbl) then return end
+			if not isstring(txtTbl[1]) or string.Trim(txtTbl[1]) == "" then return end
+
+			hg.bots.ReportNoise(ply:EyePos(), hg_bot_voice_radius:GetFloat() * mult, ply, "voice")
+		end)
 	end)
 --//
 
@@ -1102,6 +1190,33 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 		return score
 	end
 
+	local FOVEA = math.cos(math.rad(12))
+
+	--- How much faster than the plain rate this bot makes ply out right now:
+	-- what it looks straight at is made out quickly (1.7x); at the edge of
+	-- the eye it is movement that is seen - a still body at half speed, a
+	-- running one at 1.5x. Whatever it is deliberately looking at
+	-- (sv_bot_watch.lua's fixation) a little quicker again.
+	local function AttentionGain(bot, data, ply, info)
+		local g = 1
+
+		if info.central then
+			local char = GetCharacter(ply)
+			local to = char:WorldSpaceCenter() - hg.bots.GetEyePos(bot)
+			local len = to:Length()
+
+			if len > 1 and bot:EyeAngles():Forward():Dot(to / len) >= FOVEA then g = 1.7 end
+		else
+			local speed = GetCharacter(ply):GetVelocity():Length2D()
+
+			g = speed < 20 and 0.5 or speed < 140 and 1 or 1.5
+		end
+
+		if data.Watch and data.Watch.fixEnt == ply then g = g * 1.2 end
+
+		return g
+	end
+
 	local function ScanOneBot(bot, data, now, candidates, dt)
 		local mem = data.Memory
 
@@ -1152,6 +1267,8 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 					if not info.central then rate = rate * hg_bot_peripheral_speed:GetFloat() end
 
 					rate = rate * (0.4 + 0.6 * info.frac) * (1 + alert) * GetTargetVisibilityMod(ply)
+
+					if hg_bot_sight_attention:GetBool() then rate = rate * AttentionGain(bot, data, ply, info) end
 
 					meter = math.min(meter + rate * dt, 1)
 				end
