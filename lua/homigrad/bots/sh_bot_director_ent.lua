@@ -30,6 +30,7 @@ function ENT:Initialize()
 	self:PhysicsInit(SOLID_VPHYSICS)
 	self:SetMoveType(MOVETYPE_VPHYSICS)
 	self:SetSolid(SOLID_VPHYSICS)
+	self:SetUseType(SIMPLE_USE)
 	self:DrawShadow(false)
 
 	local phys = self:GetPhysicsObject()
@@ -37,6 +38,11 @@ function ENT:Initialize()
 	if IsValid(phys) then phys:Wake() end
 
 	print("[hg.bots] director entity placed - the director is now running (hg_bot_director_status)")
+end
+
+function ENT:Use(activator)
+	if CLIENT or not IsValid(activator) or not activator:IsPlayer() then return end
+	activator:ConCommand("hg_bot_director_menu")
 end
 
 function ENT:OnRemove()

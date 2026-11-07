@@ -236,18 +236,39 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 		local row
 
 		if info.choices then
-			row = vgui.Create("DComboBox", panel)
-			row:SetTall(26)
-			row:SetSortItems(false)
-			for index, key in ipairs(info.choices) do row:AddChoice(L(key), index - 1) end
-			row.OnSelect = function(self, index, text, value)
-				if self.Updating or not bounds[name] then return end
-				SetValue(name, value)
+			row = vgui.Create("DPanel", panel)
+			row:SetTall(24 + #info.choices * 34)
+			row.Paint = function() end
+			row.Label = vgui.Create("DLabel", row)
+			row.Label:Dock(TOP)
+			row.Label:SetTall(22)
+			row.Label:SetText(hg.bots.LSetting(name))
+			row.ChoiceButtons = {}
+			for index, key in ipairs(info.choices) do
+				local value = index - 1
+				local button = vgui.Create("DButton", row)
+				button:SetText(L(key))
+				button:Dock(TOP)
+				button:DockMargin(0, 2, 0, 2)
+				button:SetTall(30)
+				button.DoClick = function()
+					if not synced or not bounds[name] or not MayEdit(info.level) then return end
+					SetValue(name, value)
+					row:Refresh()
+				end
+				button.Paint = function(self, w, h)
+					local col = self.ChoiceSelected and DARK.accent or (dark and DARK.row or Color(215, 220, 225))
+					draw.RoundedBox(4, 0, 0, w, h, col)
+				end
+				Paint(button, dark)
+				row.ChoiceButtons[index] = button
 			end
 			row.Refresh = function(self)
-				self.Updating = true
-				self:ChooseOptionID(math.Clamp(math.floor(values[name] or 0) + 1, 1, #info.choices))
-				self.Updating = nil
+				local selected = math.floor(values[name] or 0) + 1
+				for index, button in ipairs(self.ChoiceButtons) do
+					button.ChoiceSelected = selected == index
+					button:SetEnabled(synced and bounds[name] ~= nil and MayEdit(info.level))
+				end
 			end
 			row:Refresh()
 		elseif info.bool then
@@ -360,6 +381,7 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 			local text = b[3] or ""
 
 			self:SetEnabled(ok)
+			if self.ChoiceButtons then self:Refresh() end
 			self:SetTooltip(ok and (name .. (text ~= "" and ("\n" .. text) or "") .. "\n" .. L("reset"))
 				or L(info.level == "superadmin" and "need.superadmin" or "need.admin"))
 		end
@@ -380,6 +402,18 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 		end
 
 		if not group then return end
+		if groupId == "director" then
+			local help = vgui.Create("DLabel", panel)
+			help:Dock(TOP)
+			help:DockMargin(4, 4, 4, 8)
+			help:SetWrap(true)
+			help:SetAutoStretchVertical(true)
+			help:SetText(L("director.settings.help"))
+			Paint(help, dark)
+			if panel.AddItem then panel:AddItem(help) end
+			Button(panel, L("act.director_on"), dark, function() Act("director_on") end)
+			Button(panel, L("act.director_off"), dark, function() Act("director_off") end)
+		end
 
 		local rows = {}
 
@@ -470,6 +504,7 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 
 		Button(panel, L("act.cleanup_now"), dark, function() Act("cleanup_now") end)
 
+		Button(panel, L("act.director_settings"), dark, function() hg.bots.OpenDirectorMenu() end)
 		Button(panel, L("act.director_on"), dark, function() Act("director_on") end)
 		Button(panel, L("act.director_off"), dark, function() Act("director_off") end)
 		Button(panel, L("act.director_place"), dark, function() Act("director_place") end)
@@ -1273,7 +1308,7 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 --//
 
 --\\ The window (C menu icon / hg_bot_menu)
-	function hg.bots.OpenMenu()
+	function hg.bots.OpenMenu(groupId)
 		if IsValid(hg.bots.MenuFrame) then hg.bots.MenuFrame:Remove() end
 
 		local frame = vgui.Create("DFrame")
@@ -1392,7 +1427,11 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 			NavButton(L("group." .. group.id), function(p) BuildGroup(p, group.id, true) end)
 		end
 
-		Show(function(p) BuildActions(p, true) end)
+		if groupId == "director" then
+			Show(function(p) BuildGroup(p, "director", true) end)
+		else
+			Show(function(p) BuildActions(p, true) end)
+		end
 
 		RequestValues()
 
@@ -1400,6 +1439,10 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 	end
 
 	concommand.Add("hg_bot_menu", function() hg.bots.OpenMenu() end)
+	function hg.bots.OpenDirectorMenu()
+		return hg.bots.OpenMenu("director")
+	end
+	concommand.Add("hg_bot_director_menu", function() hg.bots.OpenDirectorMenu() end)
 
 	-- C menu: the icon row along the bottom of the context menu.
 	--
