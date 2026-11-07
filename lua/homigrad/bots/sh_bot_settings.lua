@@ -18,7 +18,7 @@ hg.bots = hg.bots or {}
 	-- Parameters that are 0/1 switches; everything else gets a slider with
 	-- the convar's own min/max.
 	local BOOLS = {
-		hg_bot_autoinit = true, hg_bot_spawn_refresh = true, hg_bot_weapon_switch = true,
+		hg_bot_autoinit = true, hg_bot_spawn_refresh = true, hg_bot_kick_on_death = true, hg_bot_weapon_switch = true,
 		hg_bot_trust = true, hg_bot_trust_forget_on_death = true,
 		hg_bot_reload_cover = true, hg_bot_prefire_look = true, hg_bot_hold_crouch = true,
 		hg_bot_ambush = true, hg_bot_slice = true, hg_bot_suppress = true, hg_bot_prone = true,
@@ -56,7 +56,7 @@ hg.bots = hg.bots or {}
 
 	local GROUPS = {
 		{ id = "general", keys = {
-			"hg_bot_autoinit", "hg_bot_spawn_refresh", "hg_bot_think_rate",
+			"hg_bot_autoinit", "hg_bot_spawn_refresh", "hg_bot_kick_on_death", "hg_bot_think_rate",
 			"hg_bot_move_turnspeed", "hg_bot_weapon_switch", "hg_bot_gear_weight",
 		}},
 		{ id = "vision", keys = {

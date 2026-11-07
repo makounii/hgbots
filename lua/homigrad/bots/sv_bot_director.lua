@@ -469,10 +469,10 @@ local hg_bot_dir_debug      = CreateConVar("hg_bot_director_debug",   "0",  {FCV
 		local alive = 0
 
 		for bot in pairs(state.bots) do
-			if IsValid(bot) and bot:Alive() then
-				alive = alive + 1
-			else
+			if not IsValid(bot) or not bot.IsHomigradBot then
 				state.bots[bot] = nil
+			elseif bot:Alive() or bot.hgBotSpawning then
+				alive = alive + 1
 			end
 		end
 
@@ -503,9 +503,16 @@ local hg_bot_dir_debug      = CreateConVar("hg_bot_director_debug",   "0",  {FCV
 		-- A fake player needs a free slot. A P2P host usually runs with far
 		-- fewer slots than a dedicated server, so this is the first thing
 		-- that stops the director there - and it used to fail silently.
-		if player.GetCount() >= game.MaxPlayers() then
-			state.lastReason = ("no free player slots (%d of %d used) - host with more slots (maxplayers)"):format(
-				player.GetCount(), game.MaxPlayers())
+		local reuseBot
+		for bot in pairs(state.bots) do
+			if IsValid(bot) and bot.IsHomigradBot and not bot:Alive() and not bot.hgBotSpawning then
+				reuseBot = bot
+				break
+			end
+		end
+		local reason = not reuseBot and hg.bots.SpawnFailure()
+		if reason then
+			state.lastReason = reason
 
 			if hg_bot_dir_debug:GetBool() then print("[hg.bots] director: " .. state.lastReason) end
 
@@ -518,8 +525,14 @@ local hg_bot_dir_debug      = CreateConVar("hg_bot_director_debug",   "0",  {FCV
 
 		local kit = hg.bots.DirectorKit(state.phase)
 		local ang = Angle(0, math.Rand(0, 360), 0)
-		local bot = hg.bots.SpawnWithKit and hg.bots.SpawnWithKit(spot + Vector(0, 0, 8), ang, kit)
-			or hg.bots.Spawn(spot + Vector(0, 0, 8), ang)
+		local bot
+		if hg.bots.SpawnWithKit then
+			bot = hg.bots.SpawnWithKit(spot + Vector(0, 0, 8), ang, kit, nil, reuseBot)
+		elseif reuseBot then
+			bot = hg.bots.Respawn(reuseBot, spot + Vector(0, 0, 8), ang)
+		else
+			bot = hg.bots.Spawn(spot + Vector(0, 0, 8), ang)
+		end
 
 		if not IsValid(bot) then
 			state.lastReason = "player.CreateNextBot failed (no free slot, or bots are blocked on this server)"
@@ -532,8 +545,8 @@ local hg_bot_dir_debug      = CreateConVar("hg_bot_director_debug",   "0",  {FCV
 		state.spawned = state.spawned + 1
 
 		-- A share of them can be on the players' side (sv_bot_factions.lua).
-		if hg.bots.SetFaction and math.random() < hg_bot_dir_guards:GetFloat() then
-			hg.bots.SetFaction(bot, "guard")
+		if hg.bots.SetFaction then
+			hg.bots.SetFaction(bot, math.random() < hg_bot_dir_guards:GetFloat() and "guard" or "raider")
 		end
 
 		if hg_bot_dir_debug:GetBool() then

@@ -619,6 +619,11 @@ util.AddNetworkString(hg.bots.NetKits)
 
 		if not level then return end
 		if not hg.bots.CanEdit(ply, level) then Deny(ply, level) return end
+		if action == "spawn" or action == "spawn_random" or action == "spawn_kit"
+			or action == "spawn_guard" or action == "spawn_neutral" then
+			local reason = hg.bots.SpawnFailure()
+			if reason then Tell(ply, "raw", reason) return end
+		end
 
 		if action == "spawn" then
 			local tr = ply:GetEyeTrace()

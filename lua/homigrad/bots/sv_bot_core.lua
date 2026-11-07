@@ -31,6 +31,7 @@ hg.bots.States = hg.bots.States or {} -- [state name] = { Enter, Think, Leave }
 
 local hg_bot_debug = CreateConVar("hg_bot_debug", "0", {FCVAR_ARCHIVE, FCVAR_NOTIFY}, "Print Tarkov AI bot state debug info", 0, 1)
 local hg_bot_think_rate = CreateConVar("hg_bot_think_rate", "0.1", {FCVAR_ARCHIVE}, "How often (seconds) bot AI state logic ticks", 0.02, 1)
+local hg_bot_kick_on_death = CreateConVar("hg_bot_kick_on_death", "0", {FCVAR_ARCHIVE}, "Disconnect bots when they die (off: keep them for the gamemode's normal respawn)", 0, 1)
 local hg_bot_spawn_refresh = CreateConVar("hg_bot_spawn_refresh", "1", {FCVAR_ARCHIVE}, "On spawn, drop the bot into a Z-City ragdoll and instantly pick it back up. That refresh pass is what makes the server apply its clothes, armour, held weapon and arm animation - without it a freshly spawned bot can stand there with nothing applied", 0, 1)
 local hg_bot_backpedal = CreateConVar("hg_bot_backpedal", "1", {FCVAR_ARCHIVE}, "A bot keeping its eyes on someone (a locked look) walks backwards facing them when it has to move away, instead of turning its back", 0, 1)
 local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVAR_ARCHIVE}, "Default turn speed (deg/sec) used for facing/movement direction whenever a state doesn't set its own data.AimSpeed (e.g. combat's slower, deliberate aim). Used for plain walking/wandering/fleeing so bots turn into a new heading instead of snapping - a bot with no motion at all yet still turns at this rate toward whatever it's about to walk or look at.", 30, 5000)
@@ -91,13 +92,16 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 
 		-- The ragdoll refresh pass (see hg.bots.RefreshBot) - a tick after
 		-- init so the spawn itself (position, loadout) is settled.
-		timer.Simple(0.1, function() hg.bots.RefreshBot(bot) end)
+		local data = bot.Bot
+		timer.Simple(0.1, function()
+			if IsValid(bot) and bot.Bot == data then hg.bots.RefreshBot(bot) end
+		end)
 
 		-- Warm-up: the loadout (Z-City's own spawn logic, or whatever gives
 		-- the bot its gun) often lands a tick or two after spawning. Pick
 		-- the best weapon once it's there instead of waiting for a fight.
 		timer.Simple(0.5, function()
-			if not IsValid(bot) or not bot.Bot or not bot:Alive() then return end
+			if not IsValid(bot) or bot.Bot ~= data or not bot:Alive() then return end
 
 			bot.Bot.NextWeaponSwitch = 0
 
@@ -145,15 +149,16 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 			return false
 		end
 
+		local ragdoll = bot.FakeRagdoll
 		timer.Simple(0.25, function()
-			if not IsValid(bot) then return end
+			if not IsValid(bot) or not bot:Alive() or bot.Bot ~= data then return end
 
 			local d = bot.Bot
 
-			if IsValid(bot.FakeRagdoll) then
+			if IsValid(ragdoll) and bot.FakeRagdoll == ragdoll then
 				-- forced: skip the "Should Fake Up" checks (we put it down
 				-- ourselves). instant: no 1 s stand-up animation.
-				hg.FakeUp(bot, true, true)
+				hg.bots.TryGetUp(bot, true, true)
 			end
 
 			if not d then return end
@@ -170,6 +175,18 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		return true
 	end
 
+	-- Mark our own stand-up calls explicitly as well as honoring Z-City's
+	-- OverrideSpawn. They can fire PlayerSpawn without starting a new life.
+	function hg.bots.TryGetUp(bot, forced, instant)
+		if not IsValid(bot) or not bot:Alive() or not hg.FakeUp then return false end
+		if bot.hgBotGettingUp then return false end
+		bot.hgBotGettingUp = true
+		local ok, result = pcall(hg.FakeUp, bot, forced, instant)
+		bot.hgBotGettingUp = nil
+		if not ok then error(result) end
+		return result
+	end
+
 	local hg_bot_autoinit = CreateConVar("hg_bot_autoinit", "1", {FCVAR_ARCHIVE}, "Automatically (re)initialize the AI on every fake-client bot each time it spawns, however it was created (hg_bot_spawn, the 'bot' command, round systems)", 0, 1)
 
 	--- Forced (re)initialization on spawn. Every spawn gets a fresh brain:
@@ -184,7 +201,7 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		-- return false for it, but hook order isn't guaranteed; when ours
 		-- ran first, every bot that stood back up got its brain wiped and
 		-- was thrown into the spawn refresh ragdoll again.
-		if OverrideSpawn then return end
+		if OverrideSpawn or ply.hgBotGettingUp or ply.hgBotSpawning then return end
 
 		-- This spawn is our own refresh pass standing the bot back up
 		-- (hg.FakeUp -> ply:Spawn), not a new life: keep the brain it has.
@@ -193,11 +210,13 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		-- Both spawn hooks can fire for the same spawn - one per tick.
 		if ply.hgBotInitTick == engine.TickCount() then return end
 		ply.hgBotInitTick = engine.TickCount()
+		local token = {}
+		ply.hgBotSpawnToken = token
 
 		-- A new life, whether or not the AI is (re)initialized on it
 		-- (sv_bot_medic.lua's Fury-13 shot listens for this).
 		timer.Simple(0, function()
-			if IsValid(ply) and ply:Alive() then hook.Run("HG_BotNewLife", ply) end
+			if IsValid(ply) and ply:Alive() and not ply.hgBotSpawning and ply.hgBotSpawnToken == token then hook.Run("HG_BotNewLife", ply) end
 		end)
 
 		if not hg_bot_autoinit:GetBool() then return end
@@ -208,7 +227,7 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		-- Next tick: position/loadout from the spawn itself are settled
 		-- by then (HomePos must be where the bot actually stands).
 		timer.Simple(0, function()
-			if not IsValid(ply) or not ply:Alive() then return end
+			if not IsValid(ply) or not ply:Alive() or ply.hgBotSpawning or ply.hgBotSpawnToken ~= token then return end
 
 			hg.bots.Init(ply)
 		end)
@@ -217,6 +236,49 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 	hook.Add("PlayerSpawn", "HG_Bots_AutoInit", AutoInit)
 	hook.Add("Player Spawn", "HG_Bots_AutoInit", AutoInit)
 
+	-- Fake players use real player slots; Lua cannot enlarge a running
+	-- server or turn a singleplayer session into a listen server.
+	function hg.bots.SpawnFailure()
+		if game.SinglePlayer() then
+			return "Singleplayer cannot host player bots. Disconnect, choose New Game, change Singleplayer to 2 or more players (e.g. 16), then start the map. You can play alone there. maxplayers cannot be changed while a map is running."
+		end
+		if player.GetCount() >= game.MaxPlayers() then
+			return ("No free player slots (%d/%d used, including dead bots). Remove unused bots or restart the server with more slots; maxplayers cannot be changed while a map is running."):format(player.GetCount(), game.MaxPlayers())
+		end
+	end
+
+	-- Used for a new client and for recycling a dead director-owned bot.
+	local function SpawnAt(bot, pos, ang)
+		bot.hgBotSpawning = true
+		bot.hgBotSpawnToken = {}
+		local token = bot.hgBotSpawnToken
+		timer.Simple(0, function()
+			if not IsValid(bot) or bot.hgBotSpawnToken ~= token then return end
+			bot:Spawn()
+			timer.Simple(0, function()
+				if not IsValid(bot) or bot.hgBotSpawnToken ~= token then return end
+				bot.hgBotSpawning = nil
+				if not bot:Alive() then return end
+				bot.hgBotRefreshDone = nil
+				if pos then bot:SetPos(pos) end
+				if ang then
+					bot:SetAngles(Angle(0, ang.y or ang[2] or 0, 0))
+					bot:SetEyeAngles(ang)
+				end
+				hg.bots.Init(bot)
+				hook.Run("HG_BotNewLife", bot)
+				hook.Run("HG_BotInitialized", bot)
+			end)
+		end)
+		return bot
+	end
+
+	function hg.bots.Respawn(bot, pos, ang)
+		if not IsValid(bot) or not bot:IsBot() or not bot.IsHomigradBot
+			or bot:Alive() or bot.hgBotSpawning then return nil end
+		return SpawnAt(bot, pos, ang)
+	end
+
 	--- Spawns a fake-player bot at a position/angle and wires it into the AI.
 	-- @param pos Vector spawn position (optional)
 	-- @param ang Angle spawn facing (optional)
@@ -224,6 +286,11 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 	-- @return Player the bot entity (may still be initializing - use the
 	--         "HG_BotInitialized" hook if you need to act once it's ready)
 	function hg.bots.Spawn(pos, ang, name)
+		local reason = hg.bots.SpawnFailure()
+		if reason then
+			print("[hg.bots] " .. reason)
+			return nil, reason
+		end
 		-- The admin's own name list first (sv_bot_models.lua).
 		local listed = not name and hg.bots.PickName and hg.bots.PickName()
 
@@ -244,32 +311,10 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 			print(("[hg.bots] Failed to create bot '%s' - player slots %d/%d. A fake player needs a free slot; host with a higher maxplayers."):format(
 				name, player.GetCount(), game.MaxPlayers()))
 
-			return nil
+			return nil, "The engine refused to create a bot despite a free player slot. Check the server console."
 		end
 
-		-- CreateBot needs a tick before the bot entity is fully usable.
-		timer.Simple(0, function()
-			if not IsValid(bot) then return end
-
-			bot:Spawn() -- flows through GM:PlayerSpawn -> hg's "Player Spawn" -> organism init
-
-			timer.Simple(0, function()
-				if not IsValid(bot) then return end
-
-				if pos then bot:SetPos(pos) end
-
-				if ang then
-					bot:SetAngles(Angle(0, ang.y or ang[2] or 0, 0))
-					bot:SetEyeAngles(ang)
-				end
-
-				hg.bots.Init(bot)
-
-				hook.Run("HG_BotInitialized", bot)
-			end)
-		end)
-
-		return bot
+		return SpawnAt(bot, pos, ang)
 	end
 
 	--- Cleanly removes a bot from the world & registry.
@@ -286,6 +331,7 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		hook.Run("HG_BotRemoved", bot, char:GetPos())
 
 		hg.bots.List[bot] = nil
+		bot.hgBotSpawnToken = nil
 		bot.IsHomigradBot = nil
 		bot:SetNWBool("hg_bot", false)
 
@@ -398,13 +444,17 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 
 	timer.Create("HG_Bots_Think", hg_bot_think_rate:GetFloat(), 0, function()
 		for bot in pairs(hg.bots.List) do
-			if not IsValid(bot) or not bot:Alive() then
-				hg.bots.Remove(bot)
+			if not IsValid(bot) then
+				hg.bots.List[bot] = nil
+				continue
+			end
+			if not bot:Alive() then
+				if hg_bot_kick_on_death:GetBool() then hg.bots.Remove(bot) end
 				continue
 			end
 
 			local data = bot.Bot
-			if not data or not data.Enabled then continue end
+			if not data or not data.Enabled or bot.hgBotSpawning then continue end
 
 			-- Safety net: ragdolled but not in "downed" (the "Fake" hook
 			-- was missed - e.g. the bot went down during its own init).
@@ -489,6 +539,11 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 
 		local data = ply.Bot
 		if not data or not data.Enabled then return end
+		if not ply:Alive() then
+			cmd:ClearButtons()
+			cmd:ClearMovement()
+			return
+		end
 
 		-- Bot CUserCmds are sticky across ticks - there's no real client
 		-- resending "nothing is held" every frame the way there is for a
@@ -808,7 +863,8 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 			ang = angle_zero
 		end
 
-		hg.bots.Spawn(pos, ang, args and args[1])
+		local bot, reason = hg.bots.Spawn(pos, ang, args and args[1])
+		if not IsValid(bot) and reason and IsValid(ply) then ply:ChatPrint("[hg.bots] " .. reason) end
 	end)
 
 	concommand.Add("hg_bot_removeall", function(ply)

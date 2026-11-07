@@ -633,10 +633,15 @@ local BLACKLIST_FILE = "hg_bots_kit_blacklist.json"
 --\\ Spawning with a kit
 	--- Spawns a bot and puts a kit on it once it's on its feet.
 	-- @param kit a loadout table, "random", a preset name, or nil
-	function hg.bots.SpawnWithKit(pos, ang, kit, name)
-		local bot = hg.bots.Spawn(pos, ang, name)
+	function hg.bots.SpawnWithKit(pos, ang, kit, name, reuseBot)
+		local bot, reason
+		if reuseBot then
+			bot = hg.bots.Respawn(reuseBot, pos, ang)
+		else
+			bot, reason = hg.bots.Spawn(pos, ang, name)
+		end
 
-		if not IsValid(bot) then return nil end
+		if not IsValid(bot) then return nil, reason end
 
 		local resolved
 
@@ -649,10 +654,12 @@ local BLACKLIST_FILE = "hg_bots_kit_blacklist.json"
 		end
 
 		if not resolved then return bot end
+		bot.hgBotExplicitKit = bot.hgBotSpawnToken
+		local token = bot.hgBotSpawnToken
 
 		-- After the spawn refresh has finished with it (sv_bot_core.lua).
 		timer.Simple(1.2, function()
-			if IsValid(bot) and bot:Alive() then hg.bots.ApplyLoadout(bot, resolved) end
+			if IsValid(bot) and bot:Alive() and bot.hgBotSpawnToken == token then hg.bots.ApplyLoadout(bot, resolved) end
 		end)
 
 		return bot
@@ -662,9 +669,11 @@ local BLACKLIST_FILE = "hg_bots_kit_blacklist.json"
 	-- random kit too when that's switched on.
 	hook.Add("HG_BotInitialized", "HG_Bots_RandomKit", function(bot)
 		if not hg_bot_kit_random:GetBool() then return end
+		if bot.hgBotExplicitKit and bot.hgBotExplicitKit == bot.hgBotSpawnToken then return end
+		local data = bot.Bot
 
 		timer.Simple(1.2, function()
-			if IsValid(bot) and bot:Alive() then hg.bots.ApplyLoadout(bot, hg.bots.RandomLoadout()) end
+			if IsValid(bot) and bot:Alive() and bot.Bot == data then hg.bots.ApplyLoadout(bot, hg.bots.RandomLoadout()) end
 		end)
 	end)
 

@@ -437,6 +437,7 @@ local GetAimCapability, IsArmPinned, FreeArms -- defined in the section below
 
 			data.AimSpeed = hg_bot_downed_aimspeed:GetFloat()
 			data.DownedSince = CurTime()
+			data.NextGetUpAttempt = nil
 			data.DownedAimCorr = nil
 			data.DownedCmdAng = nil
 			data.DownedStallSince = nil
@@ -456,6 +457,7 @@ local GetAimCapability, IsArmPinned, FreeArms -- defined in the section below
 			data.AttackingSecondary = false
 			data.AimSpeed = nil
 			data.DownedSince = nil
+			data.NextGetUpAttempt = nil
 			data.DownedAimCorr = nil
 			data.DownedCmdAng = nil
 			data.DownedStallSince = nil
@@ -715,7 +717,11 @@ local GetAimCapability, IsArmPinned, FreeArms -- defined in the section below
 				return
 			end
 
-			if hg.FakeUp(bot, forced) then
+			-- FakeUp can start a stand-up animation before returning success.
+			-- Let it finish instead of repeating the work every AI tick.
+			if now < (data.NextGetUpAttempt or 0) then return end
+			data.NextGetUpAttempt = now + 1.5
+			if hg.bots.TryGetUp(bot, forced) then
 				data.UseKey = false
 				data.Attacking = false
 				data.AttackingSecondary = false

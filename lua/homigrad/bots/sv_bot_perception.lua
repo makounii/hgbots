@@ -1417,11 +1417,9 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 
 			-- A bot only sees candidates it may actually fight: its own
 			-- squad is filtered out here rather than inside the scan.
-			if hg.bots.FilterTargets then
-				candidates = hg.bots.FilterTargets(bot, candidates) or candidates
-			end
+			local targets = hg.bots.FilterTargets and hg.bots.FilterTargets(bot, candidates) or candidates
 
-			local ok, err = pcall(ScanOneBot, bot, data, now, candidates, rate)
+			local ok, err = pcall(ScanOneBot, bot, data, now, targets, rate)
 
 			if not ok then
 				print(("[hg.bots] ERROR scanning %s: %s"):format(tostring(bot), tostring(err)))
