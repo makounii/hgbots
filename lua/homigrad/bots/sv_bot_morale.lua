@@ -166,7 +166,8 @@ local hg_bot_morale_debug   = CreateConVar("hg_bot_morale_debug",   "0",    {FCV
 
 		for bot in pairs(hg.bots.List) do
 			if IsValid(bot) and bot ~= victim and bot:Alive() and bot.Bot and bot.Bot.Enabled then
-				if bot:GetPos():DistToSqr(pos) < radiusSqr then out[#out + 1] = bot end
+				local friendly = not victim.IsHomigradBot or not hg.bots.IsFriendly or hg.bots.IsFriendly(bot, victim)
+				if friendly and bot:GetPos():DistToSqr(pos) < radiusSqr then out[#out + 1] = bot end
 			end
 		end
 

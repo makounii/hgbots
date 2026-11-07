@@ -235,7 +235,22 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 		local bound = bounds[name] or { 0, 1, "", 0 }
 		local row
 
-		if info.bool then
+		if info.choices then
+			row = vgui.Create("DComboBox", panel)
+			row:SetTall(26)
+			row:SetSortItems(false)
+			for index, key in ipairs(info.choices) do row:AddChoice(L(key), index - 1) end
+			row.OnSelect = function(self, index, text, value)
+				if self.Updating or not bounds[name] then return end
+				SetValue(name, value)
+			end
+			row.Refresh = function(self)
+				self.Updating = true
+				self:ChooseOptionID(math.Clamp(math.floor(values[name] or 0) + 1, 1, #info.choices))
+				self.Updating = nil
+			end
+			row:Refresh()
+		elseif info.bool then
 			row = vgui.Create("DCheckBoxLabel", panel)
 			row:SetText(hg.bots.LSetting(name))
 

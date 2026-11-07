@@ -50,7 +50,7 @@ hg.bots = hg.bots or {}
 		hg_bot_friendlyfire = true,
 		hg_bot_navpatch_follow = true, hg_bot_navpatch_gap = true, hg_bot_navpatch_maxgap = true,
 		hg_bot_navpatch_slice = true, hg_bot_navpatch_width = true, hg_bot_navpatch_rate = true,
-		hg_bot_director = true, hg_bot_director_max = true, hg_bot_director_difficulty = true,
+		hg_bot_director = true, hg_bot_director_mode = true, hg_bot_director_max = true, hg_bot_director_difficulty = true,
 		hg_bot_factions = true, hg_bot_npc = true,
 	}
 
@@ -174,7 +174,7 @@ hg.bots = hg.bots or {}
 			"hg_bot_npc", "hg_bot_npc_range",
 		}},
 		{ id = "director", keys = {
-			"hg_bot_director", "hg_bot_director_difficulty", "hg_bot_director_max",
+			"hg_bot_director", "hg_bot_director_mode", "hg_bot_director_difficulty", "hg_bot_director_max",
 			"hg_bot_director_per_player", "hg_bot_director_rate",
 			"hg_bot_director_min_dist", "hg_bot_director_max_dist",
 			"hg_bot_director_buildup", "hg_bot_director_peak", "hg_bot_director_relax",
@@ -195,6 +195,10 @@ hg.bots = hg.bots or {}
 		}},
 	}
 
+	local CHOICES = {
+		hg_bot_director_mode = { "director.mode.survival", "director.mode.tdm", "director.mode.ffa" },
+	}
+
 	hg.bots.SettingGroups = GROUPS
 	hg.bots.SettingIndex = {} -- [convar name] = { group, level, bool }
 
@@ -204,6 +208,7 @@ hg.bots = hg.bots or {}
 				group = group.id,
 				level = SUPER[name] and "superadmin" or "admin",
 				bool = BOOLS[name] or false,
+				choices = CHOICES[name],
 			}
 		end
 	end

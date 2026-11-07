@@ -545,7 +545,9 @@ local hg_bot_dir_debug      = CreateConVar("hg_bot_director_debug",   "0",  {FCV
 		state.spawned = state.spawned + 1
 
 		-- A share of them can be on the players' side (sv_bot_factions.lua).
-		if hg.bots.SetFaction then
+		if hg.bots.ConfigureDirectorBot then
+			hg.bots.ConfigureDirectorBot(bot)
+		elseif hg.bots.SetFaction then
 			hg.bots.SetFaction(bot, math.random() < hg_bot_dir_guards:GetFloat() and "guard" or "raider")
 		end
 
@@ -627,7 +629,9 @@ local hg_bot_dir_debug      = CreateConVar("hg_bot_director_debug",   "0",  {FCV
 		local inPhase = now - state.phaseSince
 		local diff = Difficulty()
 
-		if state.phase == "idle" then
+		if hg.bots.DirectorMode and hg.bots.DirectorMode() ~= 0 then
+			SetPhase("peak") -- deathmatch keeps replacing losses without rest phases
+		elseif state.phase == "idle" then
 			-- Anything happening, or simply long enough quiet: start again.
 			if pressure > 0.25 or inPhase > 20 then SetPhase("buildup") end
 		elseif state.phase == "buildup" then
@@ -675,6 +679,8 @@ local hg_bot_dir_debug      = CreateConVar("hg_bot_director_debug",   "0",  {FCV
 		say(("[hg.bots] director: %s (switch %s, entities %d), phase %s for %.0f s, pressure %.2f"):format(
 			Running() and "running" or "off", hg_bot_director:GetBool() and "on" or "off",
 			#ents.FindByClass("ent_hg_director"), state.phase, CurTime() - state.phaseSince, state.pressure))
+		local modes = { [0] = "survival", [1] = "TDM (players and guards vs raiders)", [2] = "free for all" }
+		say("  combat mode: " .. modes[hg.bots.DirectorMode and hg.bots.DirectorMode() or 0])
 		say(("  difficulty %d, its bots alive %d, cap %d, spawned in total %d, player spread %.0f u"):format(
 			hg_bot_dir_difficulty:GetInt(), hg.bots.DirectorAlive(), hg_bot_dir_max:GetInt(), state.spawned, state.spread or 0))
 		say(("  slots %d/%d, navmesh %s, wants %d bots now"):format(

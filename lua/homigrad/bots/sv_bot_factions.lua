@@ -92,6 +92,8 @@ hg.bots.Factions = { raider = true, guard = true, neutral = true }
 	function hg.bots.SameFaction(a, b)
 		if not IsValid(a) or not IsValid(b) then return false end
 		if not (a.IsHomigradBot and b.IsHomigradBot) then return false end
+		local friendly = hg.bots.DirectorFriendly and hg.bots.DirectorFriendly(a, b)
+		if friendly ~= nil then return friendly end
 		if not hg_bot_factions:GetBool() then return true end
 
 		return hg.bots.GetFaction(a) == hg.bots.GetFaction(b)
@@ -222,6 +224,8 @@ hg.bots.Factions = { raider = true, guard = true, neutral = true }
 	function hg.bots.FactionHostile(ent, bot)
 		if not IsValid(ent) or not IsValid(bot) then return false end
 		if ent == bot then return false end
+		local friendly = hg.bots.DirectorFriendly and hg.bots.DirectorFriendly(ent, bot)
+		if friendly ~= nil then return not friendly end
 
 		-- NPCs: hostile unless whitelisted.
 		if not ent:IsPlayer() then
@@ -303,7 +307,7 @@ hg.bots.Factions = { raider = true, guard = true, neutral = true }
 	--- Adds everything besides the human players to perception's candidate
 	-- list: other bots (factions sort out who fights whom) and NPCs.
 	function hg.bots.ExtraTargets(list)
-		if hg_bot_factions:GetBool() then
+		if hg_bot_factions:GetBool() or (hg.bots.DirectorMode and hg.bots.DirectorMode() ~= 0) then
 			for bot in pairs(hg.bots.List) do
 				if IsValid(bot) and bot:Alive() then list[#list + 1] = bot end
 			end
@@ -361,6 +365,7 @@ hg.bots.Factions = { raider = true, guard = true, neutral = true }
 	-- instead of wandering off on its own. Called from the idle state's
 	-- extension points (sv_bot_navigation.lua) through CheckGuardEscort.
 	function hg.bots.CheckGuardEscort(bot, data)
+		if hg.bots.IsDirectorBot and hg.bots.IsDirectorBot(bot) and hg.bots.DirectorMode() == 2 then return false end
 		if not hg_bot_factions:GetBool() then return false end
 		if hg.bots.GetFaction(bot) ~= "guard" then return false end
 

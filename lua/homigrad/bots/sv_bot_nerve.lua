@@ -148,7 +148,7 @@ local function Odds(bot, target)
 	for other in pairs(hg.bots.List) do
 		local od = other ~= bot and IsValid(other) and other:Alive() and other.Bot
 
-		if od and od.Enabled and od.State ~= "flee" and not IsValid(other.FakeRagdoll)
+		if od and od.Enabled and hg.bots.IsFriendly and hg.bots.IsFriendly(bot, other) and od.State ~= "flee" and not IsValid(other.FakeRagdoll)
 			and od.Memory and od.Memory.Target == target and other:GetPos():DistToSqr(pos) < r2
 		then
 			allies = allies + 1

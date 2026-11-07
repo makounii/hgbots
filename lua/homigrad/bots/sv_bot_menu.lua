@@ -290,6 +290,7 @@ util.AddNetworkString(hg.bots.NetKits)
 
 		if min then value = math.max(value, min) end
 		if max then value = math.min(value, max) end
+		if hg.bots.SettingIndex[name].choices then value = math.floor(value) end
 
 		cvar:SetFloat(value)
 

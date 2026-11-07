@@ -180,6 +180,8 @@ local hg_bot_squad_pushers  = CreateConVar("hg_bot_squad_pushers",  "2",    {FCV
 						timer.Simple(at - CurTime(), function()
 							if not IsValid(other) or not IsValid(target) or not other.Bot then return end
 							if not target:Alive() then return end
+								if not hg.bots.IsFriendly(bot, other) then return end
+								if hg.bots.IsHostile and not hg.bots.IsHostile(target, other) then return end
 
 							local m = other.Bot.Memory
 
@@ -230,7 +232,7 @@ local hg_bot_squad_pushers  = CreateConVar("hg_bot_squad_pushers",  "2",    {FCV
 		local now = CurTime()
 
 		for other, s in pairs(hg.bots.Suppressors) do
-			if IsValid(other) and other ~= bot and s.expires > now and s.spot:DistToSqr(spot) < 300 * 300 then
+			if IsValid(other) and other ~= bot and hg.bots.IsFriendly(bot, other) and s.expires > now and s.spot:DistToSqr(spot) < 300 * 300 then
 				return true
 			end
 		end
@@ -253,7 +255,15 @@ local hg_bot_squad_pushers  = CreateConVar("hg_bot_squad_pushers",  "2",    {FCV
 
 				if IsValid(target) then
 					byTarget[target] = byTarget[target] or {}
-					table.insert(byTarget[target], bot)
+					local group
+					for _, allies in ipairs(byTarget[target]) do
+						if hg.bots.IsFriendly(bot, allies[1]) then group = allies break end
+					end
+					if not group then
+						group = {}
+						table.insert(byTarget[target], group)
+					end
+					table.insert(group, bot)
 				else
 					data.SquadRole = nil
 				end
@@ -262,29 +272,31 @@ local hg_bot_squad_pushers  = CreateConVar("hg_bot_squad_pushers",  "2",    {FCV
 
 		local pushers = hg_bot_squad_pushers:GetInt()
 
-		for target, bots in pairs(byTarget) do
+		for target, groups in pairs(byTarget) do
 			local tPos = target:GetPos()
+			for _, bots in ipairs(groups) do
 
-			table.sort(bots, function(a, b) return a:GetPos():DistToSqr(tPos) < b:GetPos():DistToSqr(tPos) end)
+				table.sort(bots, function(a, b) return a:GetPos():DistToSqr(tPos) < b:GetPos():DistToSqr(tPos) end)
 
-			for i, bot in ipairs(bots) do
-				local role
+				for i, bot in ipairs(bots) do
+					local role
 
-				if #bots == 1 then
-					role = nil -- alone: no squad behaviour, act normally
-				elseif i == 1 then
-					role = "push"
-				elseif i <= pushers then
-					role = "flank"
-				else
-					role = "support"
+					if #bots == 1 then
+						role = nil -- alone: no squad behaviour, act normally
+					elseif i == 1 then
+						role = "push"
+					elseif i <= pushers then
+						role = "flank"
+					else
+						role = "support"
+					end
+
+					if role and bot.Bot.SquadRole ~= role and hg.bots.Say then
+						hg.bots.Say(bot, role == "support" and "spreadout" or "going")
+					end
+
+					bot.Bot.SquadRole = role
 				end
-
-				if role and bot.Bot.SquadRole ~= role and hg.bots.Say then
-					hg.bots.Say(bot, role == "support" and "spreadout" or "going")
-				end
-
-				bot.Bot.SquadRole = role
 			end
 		end
 	end
@@ -333,7 +345,7 @@ local hg_bot_squad_pushers  = CreateConVar("hg_bot_squad_pushers",  "2",    {FCV
 		for other in pairs(hg.bots.List) do
 			local data = IsValid(other) and other ~= bot and other.Bot
 
-			if data then
+			if data and hg.bots.IsFriendly(bot, other) then
 				local theirs = data.Goal or data.MoveTarget
 
 				if theirs and theirs:DistToSqr(pos) < spreadSqr then
