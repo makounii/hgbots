@@ -308,6 +308,7 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 			end
 
 			row.Refresh = function(self)
+				self.Updating = true
 				local b = bounds[name]
 
 				if b then
@@ -315,7 +316,6 @@ local L = function(key) return hg.bots.L and hg.bots.L(key) or key end
 					self:SetDecimals((b[2] or 1) > 20 and 0 or 2)
 				end
 
-				self.Updating = true
 				self:SetValue(values[name] or 0)
 				self.Updating = nil
 			end
