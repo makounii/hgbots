@@ -390,7 +390,15 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		-- switched it to combat, and every following bullet did it again.
 		-- Redirect here so no caller (threat hooks, spotted hook, combat's
 		-- re-evaluation, error recovery) can pull a downed bot out.
-		if IsValid(bot.FakeRagdoll) and state ~= "downed" and hg.bots.States.downed and not data.Refreshing then
+		-- Seated in a car (sv_bot_vehicle.lua): Z-City straps a seated player
+		-- in as a ragdoll, which is not being knocked down - and nothing but
+		-- the drive state knows how to get a bot out of a seat, so nothing
+		-- else may take it over while it sits there. (The drive state hears
+		-- about threats itself and decides: run him over, or stop and get
+		-- out.)
+		if data.InVehicle then
+			if state ~= "drive" then return end
+		elseif IsValid(bot.FakeRagdoll) and state ~= "downed" and hg.bots.States.downed and not data.Refreshing then
 			if data.State == "downed" then return end
 
 			state = "downed"
@@ -442,6 +450,26 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		})
 	end
 
+	-- One think: sv_bot_watch.lua's looking about rides on the idle and
+	-- alert thinks; it may also take a think over (returns true). (A plain
+	-- function handed to pcall with its arguments - this used to build a
+	-- new closure for every think of every bot.)
+	local function RunThink(bot, data, state, name)
+		if hg.bots.BeforeThink and hg.bots.BeforeThink(bot, data, name) then return end
+
+		state.Think(bot, data)
+
+		if hg.bots.AfterThink then hg.bots.AfterThink(bot, data, name) end
+
+		-- Strolling or standing watch with no player anywhere near
+		-- (hg_bot_lod, sv_bot_navigation.lua): think a little less often.
+		if data.Far and not data.Memory.Target and (name == "idle" or name == "alert" or name == "hold") then
+			local slow = CurTime() + 0.3
+
+			if (data.NextStateThink or 0) < slow then data.NextStateThink = slow end
+		end
+	end
+
 	timer.Create("HG_Bots_Think", hg_bot_think_rate:GetFloat(), 0, function()
 		for bot in pairs(hg.bots.List) do
 			if not IsValid(bot) then
@@ -456,9 +484,14 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 			local data = bot.Bot
 			if not data or not data.Enabled or bot.hgBotSpawning then continue end
 
+			-- Marked as seated in a car but not in one (thrown out, the seat
+			-- removed under it): the mark must not outlive the seat, or
+			-- nothing could ever take the bot over again.
+			if data.InVehicle and not bot:InVehicle() then data.InVehicle = nil end
+
 			-- Safety net: ragdolled but not in "downed" (the "Fake" hook
 			-- was missed - e.g. the bot went down during its own init).
-			if data.State ~= "downed" and IsValid(bot.FakeRagdoll) and hg.bots.States.downed and not data.Refreshing then
+			if data.State ~= "downed" and IsValid(bot.FakeRagdoll) and hg.bots.States.downed and not data.Refreshing and not data.InVehicle then
 				hg.bots.SetState(bot, "downed")
 			end
 
@@ -472,15 +505,7 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 
 				local name = data.State
 
-				-- sv_bot_watch.lua's looking about rides on the idle and
-				-- alert thinks; it may also take a think over (returns true).
-				local ok, err = pcall(function()
-					if hg.bots.BeforeThink and hg.bots.BeforeThink(bot, data, name) then return end
-
-					state.Think(bot, data)
-
-					if hg.bots.AfterThink then hg.bots.AfterThink(bot, data, name) end
-				end)
+				local ok, err = pcall(RunThink, bot, data, state, name)
 
 				if not ok then
 					print(("[hg.bots] ERROR in '%s' state Think for %s: %s"):format(tostring(data.State), tostring(bot), tostring(err)))
@@ -519,17 +544,26 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 	-- is what anybody does; turning your back on him was the bug.
 	local LOOK_LOCK_MAX = 105
 
-	--- @return boolean off path, number|nil the yaw difference
-	local function LookIsOffPath(ply, lookPos, moveDir, limit)
-		local to = lookPos - ply:EyePos()
+	local COS_OFF_PATH, COS_LOCK_MAX = math.cos(math.rad(LOOK_OFF_PATH)), math.cos(math.rad(LOOK_LOCK_MAX))
 
-		to.z = 0
+	--- Is lookPos further round from the way the bot walks than the limit?
+	-- (The cosine of the angle between the two flat directions - this runs
+	-- for every walking bot on every tick, and used to build two Angles to
+	-- compare one number.)
+	-- @return boolean off path
+	local function LookIsOffPath(ply, lookPos, moveDir, locked)
+		local eye = ply:EyePos()
+		local tx, ty = lookPos.x - eye.x, lookPos.y - eye.y
+		local len2 = tx * tx + ty * ty
 
-		if to:LengthSqr() < 1 then return false end
+		if len2 < 1 then return false end
 
-		local diff = math.abs(math.NormalizeAngle(to:Angle().y - moveDir:Angle().y))
+		local mx, my = moveDir.x, moveDir.y
+		local ml2 = mx * mx + my * my
 
-		return diff > (limit or LOOK_OFF_PATH), diff
+		if ml2 < 0.0001 then return false end
+
+		return (tx * mx + ty * my) / math.sqrt(len2 * ml2) < (locked and COS_LOCK_MAX or COS_OFF_PATH)
 	end
 
 	-- Translates the bot's high-level intent (data.MoveTarget / data.LookPos)
@@ -553,6 +587,44 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		-- caused bots to get permanently stuck crouched.
 		cmd:ClearButtons()
 
+		-- Seated in a vehicle: sv_bot_vehicle.lua drives (the car's own
+		-- inputs, not these keys), and nothing below applies to a man
+		-- strapped into a seat.
+		if data.InVehicle then
+			cmd:ClearMovement()
+
+			hook.Run("HG_BotCommand", ply, cmd, data)
+
+			return
+		end
+
+		-- Standing with nothing to look at, nowhere to go and no key to
+		-- hold: an empty command, and none of the view / movement work
+		-- below. (Every tick of every bot - worth not doing for nothing.)
+		local now = CurTime()
+
+		if not (data.MoveTarget or data.LookPos or data.Attacking or data.AttackingSecondary or data.Reloading
+			or data.UseKey or data.Crouching or data.NavCrouch or data.CrawlPull or data.GroundChoke
+			or data.CrawlGrab or data.Martyr or data.SlowWalk or (data.Lean and data.Lean ~= 0)
+			or (data.DuckUntil and now < data.DuckUntil) or (data.JumpUntil and now < data.JumpUntil)
+			or (data.UsePulseUntil and now < data.UsePulseUntil) or (data.ForceAttackUntil and now < data.ForceAttackUntil)
+			or (data.ForceLookUntil and now < data.ForceLookUntil) or (data.DefendUntil and now < data.DefendUntil))
+		then
+			local wep = ply:GetActiveWeapon()
+
+			-- (A grenade in hand goes the long way: its pin logic is there.)
+			if not (IsValid(wep) and wep.Throw ~= nil) then
+				cmd:SetForwardMove(0)
+				cmd:SetSideMove(0)
+
+				data.BackViewTick = nil
+
+				hook.Run("HG_BotCommand", ply, cmd, data)
+
+				return
+			end
+		end
+
 		-- Figure out the movement direction first (if any) so it can double
 		-- as the default facing when nothing else wants control of the view.
 		local moveDir
@@ -568,8 +640,8 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 			end
 		end
 
-		local desiredAng = ply:EyeAngles()
-		local now = CurTime()
+		local curAng = ply:EyeAngles()
+		local desiredAng = curAng
 		local backing = false
 
 		-- Defensive reaction (sv_bot_melee.lua's block/parry): overrides
@@ -588,7 +660,7 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		elseif forcedLook then
 			desiredAng = (data.ForceLookPos - ply:EyePos()):Angle()
 			desiredAng.r = 0
-		elseif data.LookPos and not (moveDir and LookIsOffPath(ply, data.LookPos, moveDir, data.LookLock and LOOK_LOCK_MAX or nil)) then
+		elseif data.LookPos and not (moveDir and LookIsOffPath(ply, data.LookPos, moveDir, data.LookLock)) then
 			desiredAng = (data.LookPos - ply:EyePos()):Angle()
 			desiredAng.r = 0
 		elseif data.LookPos and data.LookLock and moveDir and hg_bot_backpedal:GetBool() and not IsValid(ply.FakeRagdoll) then
@@ -624,7 +696,6 @@ local hg_bot_move_turnspeed = CreateConVar("hg_bot_move_turnspeed", "360", {FCVA
 		-- same as it already did) reads as a person banking into a turn
 		-- rather than a marker snapping between points.
 		local turnSpeed = defending and (data.DefendTurnSpeed or 900) or forcedLook and 720 or data.AimSpeed or hg_bot_move_turnspeed:GetFloat()
-		local curAng = ply:EyeAngles()
 		local tick = engine.TickCount()
 
 		-- Backing off: turn on from the view set last tick. Between two

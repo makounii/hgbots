@@ -42,6 +42,9 @@ hg.bots = hg.bots or {}
 		hg_bot_debug = true, hg_bot_pathviz = true, hg_bot_navpatch_debug = true, hg_bot_morale_debug = true,
 		hg_bot_sight_attention = true, hg_bot_watch = true, hg_bot_nerve = true, hg_bot_nerve_debug = true,
 		hg_bot_flee_keep = true, hg_bot_flee_ways = true, hg_bot_backpedal = true,
+		hg_bot_lod = true, hg_bot_zcperf = true,
+		hg_bot_wclass = true, hg_bot_wclass_debug = true, hg_bot_sniper_idle = true,
+		hg_bot_vehicles = true, hg_bot_vehicle_ram = true, hg_bot_vehicle_debug = true,
 	}
 
 	-- Parameters only a superadmin may touch (they change how the server
@@ -56,6 +59,8 @@ hg.bots = hg.bots or {}
 
 	local GROUPS = {
 		{ id = "general", keys = {
+			"hg_bot_lod", "hg_bot_lod_dist", "hg_bot_zcperf",
+			"hg_bot_vehicles", "hg_bot_vehicle_trip", "hg_bot_vehicle_ram", "hg_bot_vehicle_search", "hg_bot_vehicle_speed",
 			"hg_bot_autoinit", "hg_bot_spawn_refresh", "hg_bot_kick_on_death", "hg_bot_think_rate",
 			"hg_bot_move_turnspeed", "hg_bot_weapon_switch", "hg_bot_gear_weight",
 		}},
@@ -80,6 +85,8 @@ hg.bots = hg.bots or {}
 			"hg_bot_watch", "hg_bot_watch_vigil", "hg_bot_watch_linger",
 		}},
 		{ id = "combat", keys = {
+			"hg_bot_wclass", "hg_bot_sniper_min", "hg_bot_sniper_max", "hg_bot_sniper_close", "hg_bot_sniper_shots",
+			"hg_bot_sniper_stay", "hg_bot_sniper_idle", "hg_bot_shotgun_range", "hg_bot_shotgun_corner",
 			"hg_bot_engage_dist", "hg_bot_backoff_frac", "hg_bot_chase_lead",
 			"hg_bot_aim_turnspeed", "hg_bot_aim_jitter", "hg_bot_aim_tolerance",
 			"hg_bot_burst_on_min", "hg_bot_burst_on_max", "hg_bot_burst_off_min", "hg_bot_burst_off_max",
@@ -191,7 +198,7 @@ hg.bots = hg.bots or {}
 		}},
 		{ id = "debug", keys = {
 			"hg_bot_debug", "hg_bot_pathviz", "hg_bot_navpatch_debug", "hg_bot_morale_debug",
-			"hg_bot_watch_debug", "hg_bot_nerve_debug",
+			"hg_bot_watch_debug", "hg_bot_nerve_debug", "hg_bot_wclass_debug", "hg_bot_vehicle_debug",
 		}},
 	}
 

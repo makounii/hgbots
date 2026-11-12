@@ -70,6 +70,9 @@ hg.bots.Factions = { raider = true, guard = true, neutral = true }
 		bot.hgBotFaction = faction
 		bot:SetNWString("hg_bot_faction", faction)
 
+		-- Who is on whose side just changed (FilterTargets remembers it).
+		for other in pairs(hg.bots.List or {}) do other.hgBotSideMemo = nil end
+
 		local data = bot.Bot
 
 		if not data then return true end
@@ -96,7 +99,11 @@ hg.bots.Factions = { raider = true, guard = true, neutral = true }
 		if friendly ~= nil then return friendly end
 		if not hg_bot_factions:GetBool() then return true end
 
-		return hg.bots.GetFaction(a) == hg.bots.GetFaction(b)
+		-- (GetFaction's own lookups, without checking both bots a second
+		-- time: this is asked for every pair of bots on every sight scan.)
+		local da, db = a.Bot, b.Bot
+
+		return ((da and da.Faction) or a.hgBotFaction or "raider") == ((db and db.Faction) or b.hgBotFaction or "raider")
 	end
 --//
 
@@ -328,13 +335,32 @@ hg.bots.Factions = { raider = true, guard = true, neutral = true }
 		local pos = bot:GetPos()
 		local out, dropped
 
+		-- Which other bots are on this bot's side is remembered for a
+		-- second: sides change when an admin changes them, and the
+		-- question was asked for every pair on every scan. A new AI
+		-- director mode (FFA / TDM) redraws the sides at once, so it
+		-- forgets straight away.
+		local now = CurTime()
+		local mode = hg.bots.DirectorMode and hg.bots.DirectorMode() or 0
+		local memo = bot.hgBotSideMemo
+
+		if not memo or now > memo.t or now < memo.t - 1 or memo.mode ~= mode then
+			memo = { t = now + 1, mode = mode }
+			bot.hgBotSideMemo = memo
+		end
+
 		for _, ent in ipairs(list) do
 			local keep = true
 
 			if ent == bot then
 				keep = false
 			elseif ent.IsHomigradBot then
-				keep = not hg.bots.SameFaction(ent, bot)
+				keep = memo[ent]
+
+				if keep == nil then
+					keep = not hg.bots.SameFaction(ent, bot)
+					memo[ent] = keep
+				end
 			elseif not ent:IsPlayer() then
 				keep = hg.bots.IsNPCTarget(ent) and pos:DistToSqr(ent:GetPos()) < npcRangeSqr
 			end

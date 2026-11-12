@@ -470,7 +470,10 @@ local hg_bot_weapon_switch       = CreateConVar("hg_bot_weapon_switch",       "1
 			-- fists at least put it in the brawl / flee logic.
 			if not GunHasAmmo(bot, wep) then return 0.5 end
 
-			return 100 + (tonumber(wep.weight) or 1)
+			-- (+ what suits the distance to the enemy: a sniper rifle is put
+			-- away for the pistol when he is on top of the bot, a shotgun
+			-- across a field - sv_bot_weaponclass.lua.)
+			return 100 + (tonumber(wep.weight) or 1) + (hg.bots.WeaponRangeScore and hg.bots.WeaponRangeScore(bot, wep) or 0)
 		end
 
 		if IsHands(wep) then return 1 end
@@ -704,6 +707,14 @@ local hg_bot_weapon_switch       = CreateConVar("hg_bot_weapon_switch",       "1
 			end
 
 			local wp, ww, wc = hg_bot_tactic_push:GetFloat(), hg_bot_tactic_wait:GetFloat(), hg_bot_tactic_careful:GetFloat()
+
+			-- The gun leans the choice (sv_bot_weaponclass.lua): a shotgun
+			-- pushes, an LMG or a sniper would rather wait for him.
+			local prof = hg.bots.WeaponProfile and hg.bots.WeaponProfile(bot)
+
+			if prof and prof.tactic then
+				wp, ww, wc = wp * prof.tactic.push, ww * prof.tactic.wait, wc * prof.tactic.careful
+			end
 			local total = wp + ww + wc
 			local r = math.Rand(0, math.max(total, 0.001))
 			local tactic = "push"

@@ -89,6 +89,121 @@ local UP_VEC = Vector(0, 0, 1)
 local HULL_MINS = Vector(-15, -15, 0)
 local HULL_MAXS = Vector(15, 15, 20)
 
+--\\ Cheap traces
+	-- The movement checks below run for every moving bot ten times a second.
+	-- Two things made them expensive, and neither was the trace itself:
+	-- - a Lua FUNCTION as the trace filter is called back for every entity
+	--   the ray touches. "Not players, not NPCs" is now a list of class
+	--   names, which the engine checks itself;
+	-- - every util.TraceLine builds a new result table of twenty-odd
+	--   fields. The hot traces write into one shared table (output = ...)
+	--   and read what they need from it straight away.
+	local BODIES = { "player" } -- class names: players + every NPC / nextbot class seen
+	local bodyClass = { player = true }
+
+	local function NoteBody(ent)
+		if not IsValid(ent) or not (ent:IsNPC() or ent:IsNextBot()) then return end
+
+		local class = ent:GetClass()
+
+		if not bodyClass[class] then
+			bodyClass[class] = true
+			BODIES[#BODIES + 1] = class
+		end
+	end
+
+	hook.Add("OnEntityCreated", "HG_Bots_BodyClasses", function(ent)
+		timer.Simple(0, function() NoteBody(ent) end)
+	end)
+
+	for _, ent in ipairs(ents.GetAll()) do NoteBody(ent) end
+
+	hg.bots.BodyFilter = BODIES
+
+	local TR = {} -- shared result; valid until the next TraceQ / HullQ
+	local lineQ = { output = TR }
+	local hullQ = { output = TR }
+	local util_TraceLine, util_TraceHull = util.TraceLine, util.TraceHull
+
+	--- util.TraceLine into the shared result table TR.
+	local function TraceQ(a, b, filter, mask)
+		lineQ.start, lineQ.endpos, lineQ.filter, lineQ.mask = a, b, filter, mask
+
+		return util_TraceLine(lineQ)
+	end
+
+	--- util.TraceHull into the shared result table TR.
+	local function HullQ(a, b, mins, maxs, filter, mask)
+		hullQ.start, hullQ.endpos, hullQ.mins, hullQ.maxs, hullQ.filter, hullQ.mask = a, b, mins, maxs, filter, mask
+
+		return util_TraceHull(hullQ)
+	end
+
+	-- util.TraceLine is looked up again whenever a test harness swaps it.
+	function hg.bots.RebindTraces() util_TraceLine, util_TraceHull = util.TraceLine, util.TraceHull end
+--//
+
+--\\ Level of detail
+	-- A bot nobody is near does not need the same attention as one a player
+	-- is looking at. "Far" = no human within hg_bot_lod_dist of it. Far bots
+	-- steer, probe and scan at a fraction of the rate; what they decide is
+	-- the same, only a little later.
+	local hg_bot_lod      = CreateConVar("hg_bot_lod",      "1",    {FCVAR_ARCHIVE}, "Bots far from every player think, look and steer less often (same behaviour, less server time)", 0, 1)
+	local hg_bot_lod_dist = CreateConVar("hg_bot_lod_dist", "3000", {FCVAR_ARCHIVE}, "A bot with no player within this distance counts as far away for hg_bot_lod", 500, 30000)
+
+	local lodFar = {} -- [bot] = true while far
+	local lodNext = 0
+
+	local function UpdateLOD()
+		local on = hg_bot_lod:GetBool()
+		local d2 = hg_bot_lod_dist:GetFloat() ^ 2
+		local humans = player.GetHumans()
+		local hpos = {}
+
+		for i = 1, #humans do
+			local h = humans[i]
+
+			-- (A spectator's eyes count too: someone watching is someone near.)
+			hpos[i] = h:Alive() and h:GetPos() or h:EyePos()
+		end
+
+		for bot in pairs(hg.bots.List or {}) do
+			local far = false
+
+			if on and IsValid(bot) then
+				far = true
+
+				local p = bot:GetPos()
+
+				for i = 1, #hpos do
+					if p:DistToSqr(hpos[i]) < d2 then far = false break end
+				end
+			end
+
+			lodFar[bot] = far or nil
+
+			if bot.Bot then bot.Bot.Far = far end
+		end
+
+		for bot in pairs(lodFar) do
+			if not (hg.bots.List or {})[bot] then lodFar[bot] = nil end
+		end
+	end
+
+	hook.Add("Think", "HG_Bots_LOD", function()
+		local now = CurTime()
+
+		if now < lodNext then return end
+
+		lodNext = now + 0.5
+
+		UpdateLOD()
+	end)
+
+	--- Is this bot far from every player (see hg_bot_lod)?
+	function hg.bots.IsFar(bot) return lodFar[bot] == true end
+--//
+
 --\\ Water
 	-- Shallow water is ground to walk on, deep water is a ledge. Any water
 	-- used to be a cliff: a bot with a puddle round its feet found every
@@ -151,12 +266,9 @@ local HULL_MAXS = Vector(15, 15, 20)
 
 --\\ Ground checks
 	-- Ground traces count props/ramps as floor; players and NPCs don't.
-	local function groundFilter(ent)
-		if not IsValid(ent) then return false end
-		if ent:IsPlayer() or ent:IsNPC() then return false end
-
-		return true
-	end
+	local Z2 = Vector(0, 0, 2)
+	local CONTENTS_WATER, CONTENTS_SLIME = CONTENTS_WATER, CONTENTS_SLIME
+	local PointContents, band = util.PointContents, bit.band
 
 	--- Is there continuous, walkable ground along the straight line a->b?
 	-- A clearance trace only answers "is there a wall"; this answers "is
@@ -181,24 +293,21 @@ local HULL_MAXS = Vector(15, 15, 20)
 		for s = 0, steps do
 			local sample = a + delta * s
 
-			local tr = util.TraceLine({
-				start = sample + up,
-				endpos = sample - down,
-				filter = groundFilter,
-				mask = MASK_NPCSOLID,
-			})
+			TraceQ(sample + up, sample - down, BODIES, MASK_NPCSOLID)
 
-			if not tr.Hit then return false end
+			if not TR.Hit then return false end
+
+			local hitZ = TR.HitPos.z
 
 			if avoidWater then
-				local floor = tr.HitPos + Vector(0, 0, 2)
-				local contents = util.PointContents(floor)
+				local floor = TR.HitPos + Z2
+				local contents = PointContents(floor)
 
-				if bit.band(contents, CONTENTS_WATER) ~= 0 and DeepAt(floor) then return false end
-				if bit.band(contents, CONTENTS_SLIME) ~= 0 then return false end
+				if band(contents, CONTENTS_WATER) ~= 0 and DeepAt(floor) then return false end
+				if band(contents, CONTENTS_SLIME) ~= 0 then return false end
 			end
 
-			if prevZ and math.abs(tr.HitPos.z - prevZ) > stepHeight then
+			if prevZ and math.abs(hitZ - prevZ) > stepHeight then
 				-- Big change between two coarse samples: a staircase (many
 				-- small steps) or a real ledge (one big one)? Look closer.
 				-- Without this, steep stairs read as ledges - bots jumped on
@@ -210,22 +319,17 @@ local HULL_MAXS = Vector(15, 15, 20)
 				for k = 1, sub do
 					local sp = from + delta * (k / sub)
 
-					local st = util.TraceLine({
-						start = sp + up,
-						endpos = sp - down,
-						filter = groundFilter,
-						mask = MASK_NPCSOLID,
-					})
+					TraceQ(sp + up, sp - down, BODIES, MASK_NPCSOLID)
 
-					if not st.Hit or math.abs(st.HitPos.z - subPrev) > stepHeight then
+					if not TR.Hit or math.abs(TR.HitPos.z - subPrev) > stepHeight then
 						return false
 					end
 
-					subPrev = st.HitPos.z
+					subPrev = TR.HitPos.z
 				end
 			end
 
-			prevZ = tr.HitPos.z
+			prevZ = hitZ
 		end
 
 		return true
@@ -237,16 +341,9 @@ local HULL_MAXS = Vector(15, 15, 20)
 	local function IsSegmentClear(a, b, filterEnt)
 		local z = Vector(0, 0, hg_bot_path_trace_z:GetFloat())
 
-		local tr = util.TraceHull({
-			start = a + z,
-			endpos = b + z,
-			mins = HULL_MINS,
-			maxs = HULL_MAXS,
-			filter = filterEnt,
-			mask = MASK_NPCSOLID_BRUSHONLY,
-		})
+		HullQ(a + z, b + z, HULL_MINS, HULL_MAXS, filterEnt, MASK_NPCSOLID_BRUSHONLY)
 
-		return not tr.Hit
+		return not TR.Hit
 	end
 
 	hg.bots.IsSegmentClear = IsSegmentClear
@@ -260,25 +357,29 @@ local HULL_MAXS = Vector(15, 15, 20)
 
 	function hg.bots.IsStepSafe(bot, dir, lookahead)
 		if not hg_bot_ledge_guard:GetBool() then return true end
-		if not IsValid(bot) or not dir then return true end
-		if not bot:IsOnGround() then return true end
+		if not dir or not bot:IsOnGround() then return true end
 
 		local pos = bot:GetPos()
 		local now = CurTime()
 		local c = bot.hgBotStepCache
 
-		if c and now - c.t < STEP_CACHE_TIME and c.dir:Dot(dir) > 0.95 and c.pos:DistToSqr(pos) < 8 * 8 then
+		if c and now - c.t < (lodFar[bot] and STEP_CACHE_TIME * 2 or STEP_CACHE_TIME) and c.dir:Dot(dir) > 0.95 and c.pos:DistToSqr(pos) < 8 * 8 then
 			return c.safe
 		end
 
 		local safe = IsSegmentWalkable(pos, pos + dir * (lookahead or 26), bot)
 
-		bot.hgBotStepCache = { t = now, dir = Vector(dir), pos = pos, safe = safe }
+		if not c then
+			c = { dir = Vector() }
+			bot.hgBotStepCache = c
+		end
+
+		c.t, c.pos, c.safe = now, pos, safe
+		c.dir:Set(dir)
 
 		return safe
 	end
 --//
-
 --\\ A*
 	local function heapPush(heap, f, id)
 		local n = heap.n + 1
@@ -329,54 +430,100 @@ local HULL_MAXS = Vector(15, 15, 20)
 		return top
 	end
 
-	--- Cost of moving from area `from` into adjacent area `to`, or nil if
-	-- the connection shouldn't be used at all.
-	local function EdgeCost(from, to, opts, avoidWater, maxDrop, climb, relaxed)
-		local toCenter = to:GetCenter()
-		local cost = from:GetCenter():Distance(toCenter)
-		local mult = 1
+	--\\ Nav cache
+	-- The search used to ask the engine about every edge it looked at:
+	-- centres, attributes, height change, water - eight calls into C and
+	-- two new Vectors per edge, thousands of edges per search on a big
+	-- map. None of that changes while a map runs, so each area is asked
+	-- once and the search itself is plain Lua numbers after that.
+	local NC = {} -- [area id] = node
+	local ncCount = -1
 
-		if to:IsUnderwater() then
-			local deep = hg.bots.IsDeepWaterArea(to)
-
-			if deep and avoidWater then return nil end
-
-			mult = mult * (deep and 3 or 1.5) -- wading is slow going
-		end
-
-		if not relaxed and to.IsBlocked and to:IsBlocked() then return nil end
-
-		if not relaxed and from.ComputeAdjacentConnectionHeightChange then
-			local dz = from:ComputeAdjacentConnectionHeightChange(to)
-
-			if dz > climb then return nil end
-			if -dz > maxDrop then return nil end
-
-			if dz > 18 then cost = cost + dz * 4 end -- climbing is slow and risky
-		end
-
-		if to:HasAttributes(NAV_AVOID) then mult = mult * 6 end
-		if to:HasAttributes(NAV_CROUCH) then mult = mult * 1.4 end
-		if to:HasAttributes(NAV_JUMP) then mult = mult * 2 end
-
-		if opts then
-			if opts.avoidPos then
-				local r = opts.avoidRadius or 700
-				local d = toCenter:Distance(opts.avoidPos)
-
-				if d < r then
-					mult = mult * (1 + (opts.avoidWeight or 2) * 2 * (1 - d / r))
-				end
-			end
-
-			if opts.avoidArea and to.IsPotentiallyVisible and to:IsPotentiallyVisible(opts.avoidArea) then
-				mult = mult * (1 + (opts.avoidWeight or 2))
-			end
-		end
-
-		return cost * mult
+	local function NavCacheReset()
+		NC = {}
+		ncCount = navmesh.GetNavAreaCount()
 	end
 
+	hg.bots.NavCacheReset = NavCacheReset
+
+	local WET_UP = Vector(0, 0, 16)
+
+	local function AreaWet(area)
+		if area:IsUnderwater() then return true end
+		if bit.band(util.PointContents(area:GetCenter() + WET_UP), CONTENTS_WATER) ~= 0 then return true end
+
+		for i = 0, 3 do
+			if bit.band(util.PointContents(area:GetCorner(i) + WET_UP), CONTENTS_WATER) ~= 0 then return true end
+		end
+
+		return false
+	end
+
+	local function Node(area)
+		local id = area:GetID()
+		local n = NC[id]
+
+		if n then return n end
+
+		local c = area:GetCenter()
+
+		n = {
+			area = area, id = id, x = c.x, y = c.y, z = c.z,
+			water = area:IsUnderwater(),
+			-- for a car (sv_bot_vehicle.lua): how narrow, no crawling / hopping,
+			-- and no water at all - the map's "underwater" flag misses pools
+			-- and shallow edges, so the middle and the corners are looked at.
+			w = math.min(area:GetSizeX(), area:GetSizeY()),
+			wet = AreaWet(area),
+			tight = area:HasAttributes(NAV_CROUCH) or area:HasAttributes(NAV_JUMP),
+			-- static part of the cost of stepping INTO this area
+			mult = (area:HasAttributes(NAV_AVOID) and 6 or 1) * (area:HasAttributes(NAV_CROUCH) and 1.4 or 1) * (area:HasAttributes(NAV_JUMP) and 2 or 1),
+			blockedAt = -1, blocked = false,
+		}
+
+		NC[id] = n
+
+		return n
+	end
+
+	--- Neighbours of a node: n.adj (nodes), n.adjDist (centre to centre),
+	-- n.adjDz (height change of the connection).
+	local function Neighbours(n)
+		local adj = n.adj
+
+		if adj then return adj end
+
+		adj = {}
+
+		local dist, dzs = {}, {}
+		local area = n.area
+		local hasDz = area.ComputeAdjacentConnectionHeightChange ~= nil
+
+		for i, nb in ipairs(area:GetAdjacentAreas()) do
+			local m = Node(nb)
+			local dx, dy, dz = m.x - n.x, m.y - n.y, m.z - n.z
+
+			adj[i] = m
+			dist[i] = math.sqrt(dx * dx + dy * dy + dz * dz)
+			dzs[i] = hasDz and area:ComputeAdjacentConnectionHeightChange(nb) or false
+		end
+
+		n.adj, n.adjDist, n.adjDz = adj, dist, dzs
+
+		return adj
+	end
+
+	--- Blocked areas (doors, nav blockers) do change: asked at most once a
+	-- second per area.
+	local function IsBlockedNode(n, now)
+		if now - n.blockedAt > 1 then
+			n.blockedAt = now
+			n.blocked = n.area.IsBlocked ~= nil and n.area:IsBlocked() or false
+		end
+
+		return n.blocked
+	end
+	--//
 	--- Waypoint flags for the transition a -> b: crouch-only area, or a
 	-- step up that needs a jump (a climb, or an area marked NAV_MESH_JUMP).
 	AreaFlags = function(a, b)
@@ -492,6 +639,10 @@ local HULL_MAXS = Vector(15, 15, 20)
 	FindNavPathStrict = function(startPos, goalPos, filterEnt, opts, relaxed)
 		if not navmesh.IsLoaded() then return nil end
 
+		-- A navmesh that grew or shrank (nav editing, generation, a load)
+		-- is looked at afresh.
+		if navmesh.GetNavAreaCount() ~= ncCount then NavCacheReset() end
+
 		local startArea = NearestArea(startPos)
 		local goalArea = NearestArea(goalPos)
 
@@ -511,15 +662,40 @@ local HULL_MAXS = Vector(15, 15, 20)
 		local maxDrop = hg_bot_max_drop:GetFloat()
 		local climb = hg_bot_climb_height:GetFloat()
 		local maxNodes = hg_bot_astar_max_nodes:GetInt()
-		local goalCenter = goalArea:GetCenter()
+		local now = CurTime()
+		local sqrt = math.sqrt
+		local IsDeep = hg.bots.IsDeepWaterArea
 
-		local areas = { [startId] = startArea }
+		local avoidPos = opts and opts.avoidPos
+		local avoidArea = opts and opts.avoidArea
+		local ax, ay, az, avoidR, avoidW
+
+		if avoidPos then
+			ax, ay, az = avoidPos.x, avoidPos.y, avoidPos.z
+			avoidR = opts.avoidRadius or 700
+		end
+
+		avoidW = opts and opts.avoidWeight or 2
+
+		-- opts.vehicle = the narrowest nav area a car may be routed through
+		local vehicle = opts and opts.vehicle and (isnumber(opts.vehicle) and opts.vehicle or 110) or nil
+
+		if avoidArea and not (IsValid(avoidArea) and avoidArea.IsPotentiallyVisible) then avoidArea = nil end
+
+		local startNode, goalNode = Node(startArea), Node(goalArea)
+		local gx, gy, gz = goalNode.x, goalNode.y, goalNode.z
+
+		local nodes = { [startId] = startNode }
 		local cameFrom = {}
 		local gScore = { [startId] = 0 }
 		local closed = {}
 		local heap = { n = 0, f = {}, id = {} }
 
-		heapPush(heap, startArea:GetCenter():Distance(goalCenter), startId)
+		do
+			local dx, dy, dz = startNode.x - gx, startNode.y - gy, startNode.z - gz
+
+			heapPush(heap, sqrt(dx * dx + dy * dy + dz * dz), startId)
+		end
 
 		local expanded = 0
 
@@ -533,21 +709,35 @@ local HULL_MAXS = Vector(15, 15, 20)
 					local id = currentId
 
 					while id do
-						table.insert(chain, 1, areas[id])
+						chain[#chain + 1] = nodes[id].area
 						id = cameFrom[id]
+					end
+
+					-- (built goal-first: turn it round)
+					for i = 1, math.floor(#chain / 2) do
+						chain[i], chain[#chain - i + 1] = chain[#chain - i + 1], chain[i]
 					end
 
 					local path, flags = {}, {}
 
 					for k = 1, #chain - 1 do
 						local a, b = chain[k], chain[k + 1]
+
+						-- An area removed under the cache: forget it all, and
+						-- this search has no answer.
+						if not IsValid(a) or not IsValid(b) then
+							NavCacheReset()
+
+							return nil
+						end
+
 						local f = AreaFlags(a, b)
 
 						local pa = a:GetClosestPointOnArea(b:GetCenter())
 						local pb = b:GetClosestPointOnArea(a:GetCenter())
-						local gx, gy = pb.x - pa.x, pb.y - pa.y
+						local hx, hy = pb.x - pa.x, pb.y - pa.y
 
-						if gx * gx + gy * gy > 20 * 20 then
+						if hx * hx + hy * hy > 20 * 20 then
 							-- A hole in the mesh between two connected areas
 							-- (typical on stairs): leave this area at its edge
 							-- and enter the next at its edge, instead of one
@@ -570,6 +760,10 @@ local HULL_MAXS = Vector(15, 15, 20)
 					path[#path + 1] = goalPos
 					flags[#flags + 1] = goalArea:HasAttributes(NAV_CROUCH) and FLAG_CROUCH or 0
 
+					-- (A car's route is not pulled tight: a body-width
+					-- shortcut past a corner is not one a car fits.)
+					if vehicle then return path, flags end
+
 					return SimplifyPath(startPos, path, flags, filterEnt)
 				end
 
@@ -578,23 +772,82 @@ local HULL_MAXS = Vector(15, 15, 20)
 
 				if expanded > maxNodes then return nil end
 
-				local current = areas[currentId]
-				local baseG = gScore[currentId]
+				local current = nodes[currentId]
 
-				for _, neighbor in ipairs(current:GetAdjacentAreas()) do
-					local nid = neighbor:GetID()
+				if not IsValid(current.area) then
+					NavCacheReset()
+
+					return nil
+				end
+
+				local baseG = gScore[currentId]
+				local adj = Neighbours(current)
+				local adjDist, adjDz = current.adjDist, current.adjDz
+
+				for i = 1, #adj do
+					local to = adj[i]
+					local nid = to.id
 
 					if not closed[nid] then
-						local step = EdgeCost(current, neighbor, opts, avoidWater, maxDrop, climb, relaxed)
+						-- Cost of stepping from current into to, or no step
+						-- at all (step = nil).
+						local step = adjDist[i]
+						local mult = to.mult
+
+						-- A route for a car: wide areas only, no water, nothing
+						-- to crawl or hop through, no step it cannot roll over.
+						if vehicle and (to.w < vehicle or to.tight or to.wet or (adjDz[i] and (adjDz[i] > 26 or adjDz[i] < -60))) then
+							step = nil
+						elseif to.water then
+							local deep = IsDeep(to.area)
+
+							if deep and avoidWater then
+								step = nil
+							else
+								mult = mult * (deep and 3 or 1.5) -- wading is slow going
+							end
+						end
+
+						if step and not relaxed then
+							if IsBlockedNode(to, now) then
+								step = nil
+							else
+								local dz = adjDz[i]
+
+								if dz then
+									if dz > climb or -dz > maxDrop then
+										step = nil
+									elseif dz > 18 then
+										step = step + dz * 4 -- climbing is slow and risky
+									end
+								end
+							end
+						end
 
 						if step then
-							local g = baseG + step
+							if avoidPos then
+								local dx, dy, dz = to.x - ax, to.y - ay, to.z - az
+								local d = sqrt(dx * dx + dy * dy + dz * dz)
+
+								if d < avoidR then
+									mult = mult * (1 + avoidW * 2 * (1 - d / avoidR))
+								end
+							end
+
+							if avoidArea and to.area:IsPotentiallyVisible(avoidArea) then
+								mult = mult * (1 + avoidW)
+							end
+
+							local g = baseG + step * mult
 
 							if g < (gScore[nid] or math.huge) then
-								areas[nid] = neighbor
+								nodes[nid] = to
 								cameFrom[nid] = currentId
 								gScore[nid] = g
-								heapPush(heap, g + neighbor:GetCenter():Distance(goalCenter), nid)
+
+								local dx, dy, dz = to.x - gx, to.y - gy, to.z - gz
+
+								heapPush(heap, g + sqrt(dx * dx + dy * dy + dz * dz), nid)
 							end
 						end
 					end
@@ -604,7 +857,6 @@ local HULL_MAXS = Vector(15, 15, 20)
 
 		return nil
 	end
-
 	local function drawPathDebug(bot, path)
 		if not hg_bot_pathviz:GetBool() then return end
 
@@ -623,7 +875,14 @@ local HULL_MAXS = Vector(15, 15, 20)
 		if not pos then return nil end
 		if not navmesh.IsLoaded() then return pos end
 
-		local area = navmesh.GetNearestNavArea(pos, false, maxDist or 600, false, true)
+		-- The area right under the point first: the "nearest area" search
+		-- is many times dearer, and nearly every point asked about (a
+		-- player's feet, a nav point) stands on one.
+		local area = navmesh.GetNavArea(pos, 72)
+
+		if not IsValid(area) then
+			area = navmesh.GetNearestNavArea(pos, false, maxDist or 600, false, true)
+		end
 
 		if not IsValid(area) then return nil end
 
@@ -679,6 +938,27 @@ local HULL_MAXS = Vector(15, 15, 20)
 			return false
 		end
 
+		local force = opts and opts.force
+
+		-- Asked for the very place it is already walking to: nothing to do.
+		-- (States ask again every think; the chase asked ten times a second.)
+		if not force and data.Path and data.GoalAsked and data.GoalAsked:DistToSqr(pos) < 20 * 20 then
+			return true
+		end
+
+		-- One search per bot every third of a second while it has a path to
+		-- walk meanwhile (five a second at most when it has none): fifteen
+		-- bots in a fight asked for 350 routes a second and got the 150 the
+		-- budget let through, most of them to a goal that had moved a step.
+		-- The newest wish waits (FollowPath asks again); a forced one -
+		-- cover, a way out - is never held up.
+		if not force and now < (data.NextSearchAt or 0) and (data.Path or now < (data.LastSearchAt or 0) + 0.2) then
+			data.PendingGoal = pos
+			data.PendingOpts = opts
+
+			return true
+		end
+
 		local snapped = hg.bots.SnapToNavmesh(pos) or pos
 
 		-- Cheap retarget: the goal moved a little (a chased target
@@ -691,6 +971,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 			if IsSegmentClear(from, snapped, bot) and IsSegmentWalkable(from, snapped, bot) then
 				data.Path[last] = snapped
 				data.Goal = snapped
+				data.GoalAsked = pos
 
 				if data.PathIndex > last then
 					data.MoveTarget = snapped
@@ -709,6 +990,8 @@ local HULL_MAXS = Vector(15, 15, 20)
 
 		data.PendingGoal = nil
 		data.PendingOpts = nil
+		data.NextSearchAt = now + (lodFar[bot] and 0.7 or 0.35) + math.Rand(0, 0.1)
+		data.LastSearchAt = now
 
 		local path, flags = hg.bots.FindNavPath(bot:GetPos(), snapped, bot, opts)
 
@@ -726,6 +1009,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 		data.PathFailPos = nil
 
 		data.Goal = snapped
+		data.GoalAsked = pos
 		data.GoalOpts = opts
 		data.Path = path
 		data.PathFlags = flags
@@ -741,10 +1025,24 @@ local HULL_MAXS = Vector(15, 15, 20)
 		return true
 	end
 
+	--- Has the place a state wants to go moved more than dist away from
+	-- where the bot is already going (or waiting to be routed to)? What
+	-- states should ask before SetGoal on a moving target, instead of
+	-- comparing with data.Goal alone - that is nil while a search waits
+	-- for its turn, and the state asked again every think.
+	function hg.bots.GoalMoved(data, pos, dist)
+		local g = data.PendingGoal or data.GoalAsked or data.Goal
+
+		if not g or not (data.Path or data.PendingGoal) then return true end
+
+		return g:DistToSqr(pos) > dist * dist
+	end
+
 	--- Clears every bit of path state (used when a state wants the bot to
 	-- stop moving right now).
 	function hg.bots.ClearPath(data)
 		data.Path = nil
+		data.GoalAsked = nil
 		data.PathFlags = nil
 		data.Goal = nil
 		data.MoveTarget = nil
@@ -1356,7 +1654,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 			endpos = bot:GetPos() + Vector(0, 0, 20) + dir * 36,
 			mins = Vector(-12, -12, 0),
 			maxs = Vector(12, 12, 14),
-			filter = function(ent) return IsValid(ent) and not (ent:IsPlayer() or ent:IsNPC()) or not IsValid(ent) end,
+			filter = BODIES,
 			mask = MASK_PLAYERSOLID,
 		})
 		local chestClear = not util.TraceLine({
@@ -1398,7 +1696,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 		end
 
 		if now >= (data.NextSteer or 0) then
-			data.NextSteer = now + STEER_INTERVAL
+			data.NextSteer = now + (data.Far and STEER_INTERVAL * 2.5 or STEER_INTERVAL)
 
 			local origin = bot:GetPos() + Vector(0, 0, 36)
 			local fwd = Vector(moveDir.x, moveDir.y, 0)
@@ -1410,19 +1708,27 @@ local HULL_MAXS = Vector(15, 15, 20)
 			local right = fwd:Cross(UP_VEC)
 
 			local function Dist(dir, len)
-				local tr = util.TraceLine({
-					start = origin,
-					endpos = origin + dir * len,
-					filter = SteerFilter,
-					mask = MASK_PLAYERSOLID,
-				})
+				TraceQ(origin, origin + dir * len, BODIES, MASK_PLAYERSOLID)
 
-				return tr.Hit and not tr.StartSolid and tr.Fraction * len or len
+				return TR.Hit and not TR.StartSolid and TR.Fraction * len or len
 			end
 
 			local dl = Dist(-right, STEER_SIDE)
 			local dr = Dist(right, STEER_SIDE)
 			local bias = 0
+
+			-- Open ground on both sides: no corner can be close enough for
+			-- the diagonal whiskers to matter more than the next look will
+			-- catch (half the traces, most of the time outdoors).
+			if dl >= STEER_SIDE and dr >= STEER_SIDE and data.SteerOpen then
+				data.SteerOpen = false -- every other look does check them
+				data.SteerBias = 0
+				data.SteerRight = right
+
+				return moveDir
+			end
+
+			data.SteerOpen = dl >= STEER_SIDE and dr >= STEER_SIDE
 
 			if dl < STEER_SIDE and dr < STEER_SIDE then
 				-- Corridor / staircase with walls on both sides: drift to
@@ -1491,7 +1797,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 
 		if now < (data.NextProbe or 0) then return end
 
-		data.NextProbe = now + PROBE_INTERVAL
+		data.NextProbe = now + (data.Far and PROBE_INTERVAL * 2 or PROBE_INTERVAL)
 
 		local pos = bot:GetPos()
 		local dir = Vector(moveDir.x, moveDir.y, 0)
@@ -1502,25 +1808,31 @@ local HULL_MAXS = Vector(15, 15, 20)
 
 		-- Doors first: a closed door reads as a wall to the checks below.
 		local chest = pos + Vector(0, 0, 44)
-		local doorTr = util.TraceLine({ start = chest, endpos = chest + dir * 64, filter = bot })
 
-		if doorTr.Hit and IsDoor(doorTr.Entity) then
-			OpenDoor(bot, data, doorTr.Entity, doorTr.HitPos)
+		TraceQ(chest, chest + dir * 64, bot)
+
+		local chestHit, chestEnt, chestPos = TR.Hit, TR.Entity, TR.HitPos
+
+		if chestHit and IsDoor(chestEnt) then
+			OpenDoor(bot, data, chestEnt, chestPos)
 			return
 		end
 
 		-- A window/glass right in the path (the navmesh doesn't know about
 		-- breakables): smash through it instead of pushing against it. Eye
 		-- level too, for a high window whose wall the chest trace hits.
-		if data.Path and not data.Breach then
-			local paneTr = doorTr
+		if data.Path and not data.Breach and chestHit then
+			local paneEnt, panePos = chestEnt, chestPos
 
-			if not IsBreakablePane(paneTr.Entity) then
+			if not IsBreakablePane(paneEnt) then
 				local eyeP = pos + Vector(0, 0, 60)
-				paneTr = util.TraceLine({ start = eyeP, endpos = eyeP + dir * 64, filter = bot })
+
+				TraceQ(eyeP, eyeP + dir * 64, bot)
+
+				paneEnt, panePos = TR.Hit and TR.Entity or nil, TR.HitPos
 			end
 
-			if paneTr.Hit and IsBreakablePane(paneTr.Entity) and StartPaneBreach(bot, data, paneTr.Entity, paneTr.HitPos) then
+			if IsBreakablePane(paneEnt) and StartPaneBreach(bot, data, paneEnt, panePos) then
 				return
 			end
 		end
@@ -1529,14 +1841,12 @@ local HULL_MAXS = Vector(15, 15, 20)
 		local stepZ = 20 -- below this the engine steps up by itself
 
 		-- Knee band: something we'd walk into that isn't just a step.
-		local low = util.TraceHull({
-			start = pos + Vector(0, 0, stepZ),
-			endpos = pos + Vector(0, 0, stepZ) + dir * PROBE_DIST,
-			mins = LOW_MINS,
-			maxs = LOW_MAXS,
-			filter = ProbeFilter,
-			mask = MASK_PLAYERSOLID,
-		})
+		local lowStart = pos + Vector(0, 0, stepZ)
+
+		HullQ(lowStart, lowStart + dir * PROBE_DIST, LOW_MINS, LOW_MAXS, BODIES, MASK_PLAYERSOLID)
+
+		-- (a plain copy: the traces below write over the shared result)
+		local low = { Hit = TR.Hit, StartSolid = TR.StartSolid, Fraction = TR.Fraction, HitNormal = TR.HitNormal }
 
 		local obstacleDist = PROBE_DIST * low.Fraction
 		local mt = data.MoveTarget
@@ -1566,7 +1876,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 			local top = util.TraceLine({
 				start = over + Vector(0, 0, maxJump + 24),
 				endpos = over + Vector(0, 0, stepZ - 4),
-				filter = ProbeFilter,
+				filter = BODIES,
 				mask = MASK_PLAYERSOLID,
 			})
 
@@ -1579,7 +1889,7 @@ local HULL_MAXS = Vector(15, 15, 20)
 					endpos = top.HitPos + Vector(0, 0, 2),
 					mins = Vector(-14, -14, 0),
 					maxs = Vector(14, 14, 36),
-					filter = ProbeFilter,
+					filter = BODIES,
 					mask = MASK_PLAYERSOLID,
 				})
 
@@ -1595,17 +1905,12 @@ local HULL_MAXS = Vector(15, 15, 20)
 
 		-- Head band: clear at the knees but blocked at head height - duck
 		-- under it (vents, low beams, table edges, fallen debris).
-		local head = util.TraceHull({
-			start = pos + Vector(0, 0, 40),
-			endpos = pos + Vector(0, 0, 40) + dir * PROBE_DIST,
-			mins = HEAD_MINS,
-			maxs = HEAD_MAXS,
-			filter = ProbeFilter,
-			mask = MASK_PLAYERSOLID,
-		})
+		if not low.Hit then
+			local headStart = pos + Vector(0, 0, 40)
 
-		if head.Hit and not low.Hit then
-			data.DuckUntil = now + 0.45
+			HullQ(headStart, headStart + dir * PROBE_DIST, HEAD_MINS, HEAD_MAXS, BODIES, MASK_PLAYERSOLID)
+
+			if TR.Hit then data.DuckUntil = now + 0.45 end
 		end
 	end
 
@@ -2238,6 +2543,11 @@ local HULL_MAXS = Vector(15, 15, 20)
 			if hg.bots.CheckGuardEscort and hg.bots.CheckGuardEscort(bot, data) then return end
 
 			if hg.bots.CheckLootReaction(bot, data) then return end
+
+			-- A sniper sets up to overlook the ground (sv_bot_weaponclass.lua),
+			-- a bot with somewhere far to go may take a car (sv_bot_vehicle.lua).
+			if hg.bots.CheckWeaponRole and hg.bots.CheckWeaponRole(bot, data) then return end
+			if hg.bots.CheckVehicleUse and hg.bots.CheckVehicleUse(bot, data) then return end
 
 			if hg.bots.FollowPath(bot, data) then
 				if now >= (data.NextWanderPick or 0) then

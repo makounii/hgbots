@@ -152,13 +152,22 @@ local ProjectLost, SlicePie -- defined in the Search section, used by it above t
 		if CurTime() >= (data.NextBurstChange or 0) then
 			data.BurstOn = not data.BurstOn
 
-			local lo, hi = hg_bot_burst_off_min, hg_bot_burst_off_max
+			-- The gun's own rhythm when it has one (sv_bot_weaponclass.lua:
+			-- taps for a pistol or a rifle at range, a long burst for an
+			-- SMG up close, one aimed round at a time for a sniper).
+			local wb = data.WBurst
 
-			if data.BurstOn then
-				lo, hi = hg_bot_burst_on_min, hg_bot_burst_on_max
+			if wb then
+				data.NextBurstChange = CurTime() + (data.BurstOn and math.Rand(wb[1], wb[2]) or math.Rand(wb[3], wb[4]))
+			else
+				local lo, hi = hg_bot_burst_off_min, hg_bot_burst_off_max
+
+				if data.BurstOn then
+					lo, hi = hg_bot_burst_on_min, hg_bot_burst_on_max
+				end
+
+				data.NextBurstChange = CurTime() + math.Rand(lo:GetFloat(), hi:GetFloat())
 			end
-
-			data.NextBurstChange = CurTime() + math.Rand(lo:GetFloat(), hi:GetFloat())
 		end
 
 		data.Attacking = data.BurstOn
@@ -848,6 +857,8 @@ local hg_bot_strafe_dist_max = CreateConVar("hg_bot_strafe_dist_max", "320", {FC
 			data.AimSpeed = nil
 			data.ReloadCover = nil
 			data.UnderFireCover = nil
+			data.NextChaseAt = nil
+			data.ChasePos = nil
 			EndCareful(data)
 			ResetSeek(data)
 		end,
@@ -882,6 +893,10 @@ local hg_bot_strafe_dist_max = CreateConVar("hg_bot_strafe_dist_max", "320", {FC
 					return
 				end
 			end
+
+			-- He is far off and out in the open, and a car stands near: fetch
+			-- it and run him down (sv_bot_vehicle.lua; asked every few seconds).
+			if hg.bots.CheckVehicleCombat and hg.bots.CheckVehicleCombat(bot, data, mem, target, now) then return end
 
 			local wep = bot:GetActiveWeapon()
 
@@ -970,6 +985,13 @@ local hg_bot_strafe_dist_max = CreateConVar("hg_bot_strafe_dist_max", "320", {FC
 
 					local tactic = hg.bots.GetTactic and hg.bots.GetTactic(bot, target, true) or "push"
 
+					-- The gun may have its own answer to "he is gone"
+					-- (sv_bot_weaponclass.lua): a shotgun tucks in behind the
+					-- corner he has to come round, a sniper goes to a perch.
+					local lostProf = hg.bots.WeaponProfile and hg.bots.WeaponProfile(bot, wep)
+
+					if lostProf and lostProf.LostSight and lostProf.LostSight(bot, data, mem, wep, target, now) then return end
+
 					-- Careful push: advance slowly, aiming down sights,
 					-- with prefires and lean-peeks (see CarefulAdvance).
 					data.SeekCareful = tactic == "careful" and IsGunWeapon(wep)
@@ -1034,11 +1056,29 @@ local hg_bot_strafe_dist_max = CreateConVar("hg_bot_strafe_dist_max", "320", {FC
 			data.LookLock = true
 
 			local engageDist = hg_bot_engage_dist:GetFloat()
+			local backoffFrac = hg_bot_backoff_frac:GetFloat()
 			local isMelee = hg.bots.IsMeleeWeapon and hg.bots.IsMeleeWeapon(wep)
+
+			-- How this class of gun is fought (sv_bot_weaponclass.lua): its
+			-- own distance, whether it gives ground, its burst rhythm.
+			local prof = not isMelee and hg.bots.WeaponProfile and hg.bots.WeaponProfile(bot, wep) or nil
+
+			if prof then
+				engageDist = prof.engage or engageDist
+				backoffFrac = prof.backoff or backoffFrac
+				data.WBurst = prof.burst and prof.burst(dist) or nil
+			else
+				data.WBurst = nil
+			end
 
 			data.Crouching = false
 
-			if data.Reloading and hg_bot_reload_cover:GetBool() and not isMelee and dist < 900 then
+			if prof and prof.Visible and prof.Visible(bot, data, mem, wep, target, dist, now) then
+				-- The class moves the bot itself (a sniper off to its perch).
+				if data.State ~= "combat" then return end
+
+				data.ReloadCover = nil
+			elseif data.Reloading and hg_bot_reload_cover:GetBool() and not isMelee and dist < 900 then
 				-- Reloading in the open in front of someone is how you die:
 				-- move to cover for the duration of the reload.
 				if not data.ReloadCover then
@@ -1055,14 +1095,20 @@ local hg_bot_strafe_dist_max = CreateConVar("hg_bot_strafe_dist_max", "320", {FC
 				else
 					data.Crouching = true -- nowhere to go - at least get small
 				end
-			elseif not isMelee and hg_bot_backoff_frac:GetFloat() > 0 and dist < engageDist * hg_bot_backoff_frac:GetFloat() then
+			elseif not isMelee and backoffFrac > 0 and dist < engageDist * backoffFrac then
 				-- Too close for a firearm fight: back off while shooting.
 				-- (Contact range is still handed to CheckCloseQuarters below.)
 				data.ReloadCover = nil
 				data.Running = false
 				data.NextReposition = nil
 
-				if not data.Path or hg.bots.FollowPath(bot, data) then
+				-- (A new way back twice a second at most: nose to nose, the
+				-- contact code below stops the bot and drops its path on
+				-- every think, and this used to answer with a forced path
+				-- search on every think.)
+				if (not data.Path or hg.bots.FollowPath(bot, data)) and now >= (data.NextBackoff or 0) then
+					data.NextBackoff = now + 0.5
+
 					local p = FindBackoffPoint(bot, targetPos, math.Rand(150, 250))
 
 					if p then hg.bots.SetGoal(bot, p, { force = true }) end
@@ -1070,6 +1116,13 @@ local hg_bot_strafe_dist_max = CreateConVar("hg_bot_strafe_dist_max", "320", {FC
 			elseif isMelee and dist <= engageDist then
 				-- Melee inside engagement range: CheckCloseQuarters owns the
 				-- movement (closing in / dueling) - no gunfight repositioning.
+				data.ReloadCover = nil
+			elseif isMelee and data.Duel and data.Duel.target == target then
+				-- A duel under way further out than that (sv_bot_melee.lua
+				-- circles and steps by itself and drops any path it finds):
+				-- no route. The chase below used to search for one on every
+				-- think and the duel threw it away on the same think - 150
+				-- path searches a second for fifteen bots in a brawl.
 				data.ReloadCover = nil
 			elseif hg.bots.ShouldStalk and hg.bots.ShouldStalk(bot, data, target, dist)
 				and hg.bots.StalkTick(bot, data, target, dist)
@@ -1084,13 +1137,32 @@ local hg_bot_strafe_dist_max = CreateConVar("hg_bot_strafe_dist_max", "320", {FC
 				data.NextReposition = nil
 
 				local lead = math.Clamp(dist / 400, 0, hg_bot_chase_lead:GetFloat())
-				local chasePos = hg.bots.PredictPosition and hg.bots.PredictPosition(targetPos, mem.TargetVel, lead, bot) or targetPos
+				-- Where he will be is worked out three times a second, not on
+				-- every think: it walks the ground ahead of him trace by trace.
+				if now >= (data.NextChasePredict or 0) or not data.ChasePos then
+					data.NextChasePredict = now + 0.3
+					data.ChasePos = hg.bots.PredictPosition and hg.bots.PredictPosition(targetPos, mem.TargetVel, lead, bot) or targetPos
+				end
 
-				if not data.Goal or data.Goal:DistToSqr(chasePos) > 96 ^ 2 then
+				local chasePos = data.ChasePos
+
+				-- A new route once the place to run to has really moved: a
+				-- step or two for a man close by, more for one far off (the
+				-- far end of a long route changes nothing about its start).
+				if now >= (data.NextChaseAt or 0) and hg.bots.GoalMoved(data, chasePos, math.max(96, dist * 0.12)) then
 					hg.bots.SetGoal(bot, chasePos)
 				end
 
-				hg.bots.FollowPath(bot, data)
+				if hg.bots.FollowPath(bot, data) then
+					-- As near as the ground lets it get and he is still out
+					-- of reach (up on a roof, a crate, across a gap; or no
+					-- route at all): stand and shoot from here, and look for
+					-- a way again in a second - not on every think, which is
+					-- what a man on a roof used to cost: a path search per
+					-- bot under him, ten times a second.
+					data.NextChaseAt = now + 1
+					data.Running = false
+				end
 			else
 				data.ReloadCover = nil
 
@@ -1135,12 +1207,22 @@ local hg_bot_strafe_dist_max = CreateConVar("hg_bot_strafe_dist_max", "320", {FC
 				end
 			end
 
+			-- A long gun shot from a knee when the bot stands still far off
+			-- (not on the move, not pinned - those set their own stance).
+			if prof and prof.crouchBeyond and dist > prof.crouchBeyond and not data.Path and not data.Running then
+				data.Crouching = true
+			end
+
 			-- Contact range takes priority over shooting.
 			if hg.bots.CheckCloseQuarters(bot, data, wep, target, canSee) then return end
 
-			-- Only pull the trigger once the view is actually on target.
+			-- Only pull the trigger once the view is actually on target - and,
+			-- with a shotgun, once he is near enough for the spread to mean
+			-- something: until then it runs the gap shut instead.
 			local aimErr = hg.bots.GetAimError(bot, eye, aimPoint)
 			local mayFire = aimErr <= hg.bots.GetAimTolerance(dist)
+				and not (prof and prof.class == "shotgun" and hg.bots.ShotgunRange and dist > hg.bots.ShotgunRange()
+					and now >= (data.NextChaseAt or 0)) -- (no way to get nearer: then from here, for what it is worth)
 				and not (hg.bots.FriendlyInLine and hg.bots.FriendlyInLine(bot, aimPoint))
 
 			hg.bots.ServiceWeapon(bot, data, wep, mayFire)

@@ -368,44 +368,220 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 	end
 
 	local sightCache = {} -- [bot] = { [target] = { t, vis, info } }
-	local SIGHT_CACHE_TIME = 0.08
+	local SIGHT_CACHE_TIME = 0.12
 
-	--- Uncached sight query. Returns visible, info where info is
+	-- Sight is the most asked question there is (every bot about every
+	-- candidate, several times a second), and a good part of what it cost
+	-- was not the traces - those are about 7 microseconds each - but the
+	-- asking: some forty calls into the engine per pair for positions,
+	-- angles, speed, weapon, flashlight, convars. So:
+	-- - what a body IS this tick (where, how fast, how visible, what it
+	--   holds) is asked once per tick and shared by everyone who looks at
+	--   it or with it: a snapshot (Snap);
+	-- - range and cone are then plain arithmetic on numbers, answered
+	--   cheapest-first, and only what passes is traced;
+	-- - the traces use one shared query and result table and one filter
+	--   list refilled in place; the answer is written into the table the
+	--   cache already holds for this pair.
+	local sTR = {}
+	local sQ = { output = sTR, mask = MASK_VISIBLE }
+	local sFilter = {}
+	local util_TraceLine = util.TraceLine
+	local cos, rad, sqrt = math.cos, math.rad, math.sqrt
+	local Z2, Z14 = Vector(0, 0, 2), Vector(0, 0, 14)
+	local TickCount = engine.TickCount
+
+	local snaps = setmetatable({}, { __mode = "k" })
+
+	--- This tick's snapshot of a body (a bot, a player, an NPC): its
+	-- character (ragdoll when down) and centre. Everything else is filled
+	-- in the first time somebody needs it (the Snap* functions below).
+	local function Snap(ent)
+		local tick = TickCount()
+		local s = snaps[ent]
+
+		if s then
+			if s.tick == tick then return s end
+		else
+			s = {}
+			snaps[ent] = s
+		end
+
+		local rag = ent.FakeRagdoll
+
+		if not IsValid(rag) then rag = nil end
+
+		local char = rag or ent
+		local c = char:WorldSpaceCenter()
+
+		s.tick, s.rag, s.char = tick, rag, char
+		s.center, s.cx, s.cy, s.cz = c, c.x, c.y, c.z
+		s.eye, s.fx, s.mod, s.p1, s.speed, s.kind, s.ax, s.wep, s.rmul = nil, nil, nil, nil, nil, nil, nil, nil, nil
+
+		return s
+	end
+
+	--- Where it sees from (hg.bots.GetEyePos for a bot, the eyes for anyone).
+	local function SnapEye(s, ent)
+		local e = s.eye
+
+		if not e then
+			e = ent.IsHomigradBot and hg.bots.GetEyePos(ent) or ent:EyePos()
+			s.eye, s.ex, s.ey, s.ez = e, e.x, e.y, e.z
+		end
+
+		return e
+	end
+
+	--- Which way it looks (s.fx, s.fy, s.fz).
+	local function SnapFwd(s, ent)
+		if not s.fx then
+			local f = ent:EyeAngles():Forward()
+
+			s.fx, s.fy, s.fz = f.x, f.y, f.z
+		end
+	end
+
+	--- Where it aims (s.ax, s.ay, s.az).
+	local function SnapAim(s, ent)
+		if not s.ax then
+			local a = ent:GetAimVector()
+
+			s.ax, s.ay, s.az = a.x, a.y, a.z
+		end
+	end
+
+	local function SnapSpeed(s)
+		local v = s.speed
+
+		if not v then
+			v = s.char:GetVelocity():Length2D()
+			s.speed = v
+		end
+
+		return v
+	end
+
+	local function SnapMod(s, ent)
+		local m = s.mod
+
+		if not m then
+			m = GetTargetVisibilityMod(ent)
+			s.mod = m
+		end
+
+		return m
+	end
+
+	--- Chest, head, legs (s.p1, s.p2, s.p3).
+	local function SnapPoints(s, ent)
+		if s.p1 then return end
+
+		local rag = s.rag
+
+		if rag then
+			s.p1 = BonePos(rag, "ValveBiped.Bip01_Spine2") or s.center
+			s.p2 = BonePos(rag, "ValveBiped.Bip01_Head1") or s.center
+			s.p3 = BonePos(rag, "ValveBiped.Bip01_Pelvis") or rag:GetPos()
+		else
+			local feet = ent:GetPos()
+			local eye = ent:EyePos()
+
+			s.p1 = LerpVector(0.55, feet, eye)
+			s.p2 = eye - Z2
+			s.p3 = feet + Z14
+		end
+	end
+
+	--- The weapon in its hands, or false.
+	local function SnapWeapon(s, ent)
+		local w = s.wep
+
+		if w == nil then
+			w = ent:GetActiveWeapon()
+
+			if not IsValid(w) then w = false end
+
+			s.wep = w
+		end
+
+		return w
+	end
+
+	hg.bots.Snap = Snap
+
+	-- The sight convars, read once per tick instead of once per pair.
+	local cvTick = -1
+	local cvRange, cvFovCos, cvPeriCos, cvReach, cvAttention
+
+	local function SightConvars()
+		local tick = TickCount()
+
+		if tick == cvTick then return end
+
+		cvTick = tick
+		cvRange = hg_bot_sight_range:GetFloat()
+		cvFovCos = cos(rad(hg_bot_sight_fov:GetFloat() * 0.5))
+		cvPeriCos = cos(rad(hg_bot_sight_fov_peripheral:GetFloat() * 0.5))
+		cvReach = hg_bot_peripheral_range:GetFloat()
+		cvAttention = hg_bot_sight_attention:GetBool()
+	end
+
+	--- Uncached sight query. Returns visible; when visible, info is filled:
 	-- { frac = visible body fraction, central = in central cone,
 	--   point = best visible aim point, dist = distance }.
-	local function ComputeSight(bot, target)
-		local eyePos = hg.bots.GetEyePos(bot)
-		local char = GetCharacter(target)
-		local center = char:WorldSpaceCenter()
+	-- quick: two body points instead of three (somebody the bot has not
+	-- begun to notice - see ScanOneBot).
+	local function ComputeSight(bot, target, info, quick)
+		SightConvars()
 
-		local baseRange = hg_bot_sight_range:GetFloat() * GetTargetVisibilityMod(target)
-		local distSqr = eyePos:DistToSqr(center)
+		local bs, ts = Snap(bot), Snap(target)
+		local eyePos = SnapEye(bs, bot)
 
-		if distSqr > baseRange * baseRange then return false end
+		local dx, dy, dz = ts.cx - bs.ex, ts.cy - bs.ey, ts.cz - bs.ez
+		local distSqr = dx * dx + dy * dy + dz * dz
 
-		local dist = math.sqrt(distSqr)
-		local dir = (center - eyePos) / math.max(dist, 0.001)
-		local fwd = bot:EyeAngles():Forward()
-		local dot = fwd:Dot(dir)
+		-- (x what this bot's own eyes add: a sniper behind its scope.)
+		local rmul = bs.rmul
 
-		local central = dot >= math.cos(math.rad(hg_bot_sight_fov:GetFloat() * 0.5))
+		if not rmul then
+			rmul = hg.bots.SightRangeMul and hg.bots.SightRangeMul(bot) or 1
+			bs.rmul = rmul
+		end
+
+		local range = cvRange * rmul
+
+		-- Further than any visibility bonus reaches (sprint x flashlight x
+		-- muzzle flash = 3.04): no need to work the bonus out.
+		if distSqr > range * range * 9.3 then return false end
+
+		local dist = sqrt(distSqr)
+
+		SnapFwd(bs, bot)
+
+		local dot = (bs.fx * dx + bs.fy * dy + bs.fz * dz) / (dist > 0.001 and dist or 0.001)
+		local central = dot >= cvFovCos
+
+		-- Behind the bot: the commonest answer of all, and now the
+		-- cheapest. (Up close - within ~2 m - anything counts: you feel
+		-- someone standing right next to you.)
+		if not central and dist > 90 and dot < cvPeriCos then return false end
+
+		local baseRange = range * SnapMod(ts, target)
+
+		if dist > baseRange then return false end
+
 		local edge = false
 
 		if not central then
-			-- Peripheral vision: wider cone, much shorter reach. Up close
-			-- (within ~2 m) anything but directly behind counts - you feel
-			-- someone standing right next to you.
-			if dot < math.cos(math.rad(hg_bot_sight_fov_peripheral:GetFloat() * 0.5)) and dist > 90 then
-				return false
-			end
-
-			local reach = hg_bot_peripheral_range:GetFloat()
+			-- Peripheral vision: wider cone, much shorter reach.
+			local reach = cvReach
 
 			if dist > baseRange * reach then
 				-- ...except for movement: the edge of the eye catches a body
 				-- on the move a good deal further out (to 75 % of the range
 				-- for a run), only it makes out less of it.
-				local speed = hg_bot_sight_attention:GetBool() and char:GetVelocity():Length2D() or 0
+				local speed = cvAttention and SnapSpeed(ts) or 0
 
 				if speed < 60 or dist > baseRange * Lerp(math.Clamp((speed - 60) / 220, 0, 1), reach + 0.1, 0.75) then
 					return false
@@ -415,39 +591,70 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 			end
 		end
 
-		local points = GetBodyPoints(target)
-		local filter = SightFilter(bot, target)
-		local visibleCount, bestPoint = 0, nil
+		SnapPoints(ts, target)
 
-		for i = 1, #points do
-			local tr = util.TraceLine({
-				start = eyePos,
-				endpos = points[i],
-				filter = filter,
-				mask = MASK_VISIBLE,
-			})
+		-- Both bodies and both ragdolls out of the way, so the only thing
+		-- that can block is the world or a genuine third object.
+		local n = 2
 
-			if not tr.Hit then
-				visibleCount = visibleCount + 1
-				bestPoint = bestPoint or points[i]
-			end
+		sFilter[1], sFilter[2] = bot, target
+
+		if bs.rag then n = n + 1 sFilter[n] = bs.rag end
+		if ts.rag then n = n + 1 sFilter[n] = ts.rag end
+
+		local wep = SnapWeapon(bs, bot)
+
+		if wep then n = n + 1 sFilter[n] = wep end
+
+		-- At the wheel (sv_bot_vehicle.lua): its own car is not a wall.
+		local car = bot.Bot and bot.Bot.InVehicle
+
+		if car and IsValid(car) then n = n + 1 sFilter[n] = car end
+
+		for i = n + 1, #sFilter do sFilter[i] = nil end
+
+		sQ.start, sQ.filter = eyePos, sFilter
+
+		local visibleCount, best = 0, nil
+
+		sQ.endpos = ts.p1
+		util_TraceLine(sQ)
+
+		if not sTR.Hit then visibleCount, best = 1, 1 end
+
+		sQ.endpos = ts.p2
+		util_TraceLine(sQ)
+
+		if not sTR.Hit then visibleCount, best = visibleCount + 1, best or 2 end
+
+		if not quick then
+			sQ.endpos = ts.p3
+			util_TraceLine(sQ)
+
+			if not sTR.Hit then visibleCount, best = visibleCount + 1, best or 3 end
 		end
 
 		if visibleCount == 0 then return false end
 
-		return true, {
-			frac = visibleCount / #points * (edge and 0.6 or 1),
-			central = central,
-			edge = edge,
-			point = bestPoint,
-			dist = dist,
-		}
+		info.frac = visibleCount / (quick and 2 or 3) * (edge and 0.6 or 1)
+		info.central = central
+		info.edge = edge
+		info.point = best == 1 and ts.p1 or best == 2 and ts.p2 or ts.p3
+		info.pointIndex = best
+		info.dist = dist
+		info.dot = dot
+
+		return true
 	end
+
+	function hg.bots.RebindSightTrace() util_TraceLine = util.TraceLine end
 
 	--- Line-of-sight + FOV + range check from bot to target. Does NOT touch
 	-- Memory - pure query, usable by other systems too. Cached briefly.
-	-- @return boolean visible, table|nil info (see ComputeSight)
-	function hg.bots.CanSee(bot, target)
+	-- @return boolean visible, table|nil info (see ComputeSight). The info
+	--         table is the cache's own, rewritten by the next look at the
+	--         same pair: read it, don't keep it.
+	function hg.bots.CanSee(bot, target, quick)
 		if not IsValid(bot) or not IsValid(target) then return false end
 		-- Players, and NPCs / nextbots once they have the small
 		-- compatibility shim (sv_bot_factions.lua) - everything downstream
@@ -470,27 +677,40 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 
 		local c = perBot[target]
 
-		if c and now - c[1] < SIGHT_CACHE_TIME then
-			return c[2], c[3]
+		if c then
+			if now - c[1] < SIGHT_CACHE_TIME then
+				return c[2], c[2] and c[3] or nil
+			end
+		else
+			c = { 0, false, {} }
+			perBot[target] = c
 		end
 
-		local vis, info = ComputeSight(bot, target)
+		local vis = ComputeSight(bot, target, c[3], quick)
 
-		perBot[target] = { now, vis, info }
+		c[1], c[2] = now, vis
 
-		return vis, info
+		return vis, vis and c[3] or nil
 	end
 
-	--- Best point to shoot at on target: a visible body point if the last
-	-- sight check found one, otherwise the chest estimate.
+	--- Best point to shoot at on target: the body point the last sight
+	-- check found visible - where that point is NOW, not where it was when
+	-- the check ran (the check is cached for a moment, a running man is
+	-- not) - otherwise the chest estimate.
 	function hg.bots.GetAimPoint(bot, target)
 		local vis, info = hg.bots.CanSee(bot, target)
+		local ts = Snap(target)
 
-		if vis and info and info.point then return info.point end
+		SnapPoints(ts, target)
 
-		return GetBodyPoints(target)[1]
+		if vis and info then
+			local i = info.pointIndex
+
+			return i == 2 and ts.p2 or i == 3 and ts.p3 or ts.p1
+		end
+
+		return ts.p1
 	end
-
 	--- Diagnostic version of CanSee that explains WHY, instead of just
 	-- true/false. Not used in the hot path.
 	function hg.bots.ExplainSight(bot, target)
@@ -514,7 +734,8 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 			"bot downed: " .. tostring(IsDowned(bot)) .. ", target downed: " .. tostring(IsDowned(target)),
 		}
 
-		local vis, info = ComputeSight(bot, target)
+		local info = {}
+		local vis = ComputeSight(bot, target, info)
 
 		if vis then
 			table.insert(lines, string.format("PASS: visible (%s vision, %.0f%% of body)", info.central and "central" or "peripheral", info.frac * 100))
@@ -599,6 +820,10 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 		generic = 0.4,
 	}
 
+	local hearTR = {}
+	local hearQ = { output = hearTR, mask = MASK_SOLID_BRUSHONLY }
+	local Z8 = Vector(0, 0, 8)
+
 	local function RandomOffset2D(radius)
 		if radius <= 0 then return Vector(0, 0, 0) end
 
@@ -650,13 +875,11 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 			-- Walls muffle. Only brushes count - a prop or a player in the
 			-- way doesn't meaningfully block sound.
 			if dist > 150 then
-				local tr = util.TraceLine({
-					start = ear,
-					endpos = pos + Vector(0, 0, 8),
-					mask = MASK_SOLID_BRUSHONLY,
-				})
+				hearQ.start, hearQ.endpos = ear, pos + Z8
 
-				if tr.Hit then
+				util.TraceLine(hearQ)
+
+				if hearTR.Hit then
 					effRadius = radius * wallMult
 
 					if dist > effRadius then continue end
@@ -1003,10 +1226,21 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 
 		local len = src:Distance(impact.HitPos)
 		local radius = hg_bot_whiz_radius:GetFloat()
+		local reach = radius * 1.3 + 80 -- (+80: feet to chest, and a ragdoll lying off its player)
+		local reachSqr = reach * reach
 
 		for bot in pairs(hg.bots.List) do
 			if not IsValid(bot) or not bot:Alive() then continue end
 			if IgnoreBotSource(shooter, bot) then continue end
+
+			-- Nowhere near the line of the shot or where it landed: most
+			-- bots, for most bullets - told apart here without the call.
+			local c = bot:GetPos()
+			local t = (c - src):Dot(dir)
+
+			if t < -reach or t > len + reach or (c - (src + dir * math.Clamp(t, 0, len))):LengthSqr() > reachSqr then
+				if c:DistToSqr(impact.HitPos) > reachSqr then continue end
+			end
 
 			local ok, err = pcall(CheckWhiz, bot, shooter, src, dir, len, impact.HitPos, radius)
 
@@ -1094,11 +1328,34 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 	-- - they've held a gun on this bot for hg_bot_aim_threat_time
 	--   (half that aiming down sights);
 	-- - they're right in front of it with a melee weapon, squared up.
+	--- How far ply's eyes are from bot, and how squarely ply aims at it
+	-- (1 = dead on). Off the two snapshots: nothing is asked twice.
+	local function AimAt(ply, bot)
+		local ps, bs = Snap(ply), Snap(bot)
+
+		SnapEye(ps, ply)
+		SnapAim(ps, ply)
+
+		local dx, dy, dz = bs.cx - ps.ex, bs.cy - ps.ey, bs.cz - ps.ez
+		local len = sqrt(dx * dx + dy * dy + dz * dz)
+
+		if len <= 1 then return len, -1 end
+
+		return len, (ps.ax * dx + ps.ay * dy + ps.az * dz) / len
+	end
+
 	local function AssessDanger(bot, mem, ply, info, now, dt)
 		mem.AimedAt = mem.AimedAt or {}
 		mem.SeenKind = mem.SeenKind or {}
 
-		local kind = WeaponKindOf(ply)
+		local ps = Snap(ply)
+		local kind = ps.kind
+
+		if not kind then
+			kind = WeaponKindOf(ply)
+			ps.kind = kind
+		end
+
 		local score = 1
 
 		-- Drawing a weapon: empty-handed a moment ago, armed now (or first
@@ -1128,10 +1385,9 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 
 		-- Still armed and close or facing us: stay wary of them.
 		if mem.WaryOf == ply and kind ~= "none" and now < (mem.WaryUntil or 0) then
-			local toBotW = GetCharacter(bot):WorldSpaceCenter() - ply:EyePos()
-			local lenW = toBotW:Length()
+			local lenW, dotW = AimAt(ply, bot)
 
-			if lenW < 500 or (lenW > 1 and ply:GetAimVector():Dot(toBotW / lenW) > 0.7) then
+			if lenW < 500 or dotW > 0.7 then
 				mem.WaryUntil = now + 4
 			end
 		elseif mem.WaryOf == ply and kind == "none" then
@@ -1147,13 +1403,12 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 		end
 
 		-- Aiming at the bot.
-		local toBot = GetCharacter(bot):WorldSpaceCenter() - ply:EyePos()
-		local dist = toBot:Length()
 		local aiming = false
+		local dist, dot = 0, -1
+
+		if kind ~= "none" then dist, dot = AimAt(ply, bot) end
 
 		if dist > 1 and kind ~= "none" then
-			local dot = ply:GetAimVector():Dot(toBot / dist)
-
 			if kind == "gun" then
 				-- Within roughly a body-width of the bot at that range.
 				local tol = math.max(math.deg(math.atan(26 / dist)), 2.5)
@@ -1201,13 +1456,9 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 		local g = 1
 
 		if info.central then
-			local char = GetCharacter(ply)
-			local to = char:WorldSpaceCenter() - hg.bots.GetEyePos(bot)
-			local len = to:Length()
-
-			if len > 1 and bot:EyeAngles():Forward():Dot(to / len) >= FOVEA then g = 1.7 end
+			if (info.dot or 0) >= FOVEA then g = 1.7 end
 		else
-			local speed = GetCharacter(ply):GetVelocity():Length2D()
+			local speed = SnapSpeed(Snap(ply))
 
 			g = speed < 20 and 0.5 or speed < 140 and 1 or 1.5
 		end
@@ -1224,9 +1475,18 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 		mem.Attackers = mem.Attackers or {}
 
 		local spot = mem.Spot
-		local maxRange = hg_bot_sight_range:GetFloat() * 2 -- covers every visibility bonus
+		local maxRange = hg_bot_sight_range:GetFloat() * 2 * (hg.bots.SightRangeMul and hg.bots.SightRangeMul(bot) or 1) -- covers every visibility bonus
 		local maxRangeSqr = maxRange * maxRange
-		local botPos = bot:GetPos()
+		local bs = Snap(bot)
+		local bcx, bcy, bcz = bs.cx, bs.cy, bs.cz
+		local sightRange = hg_bot_sight_range:GetFloat()
+		local quickSqr = (sightRange * 0.5) ^ 2
+		local periSpeed = hg_bot_peripheral_speed:GetFloat()
+		local attention = hg_bot_sight_attention:GetBool()
+		local pass = (data.ScanPass or 0) + 1
+
+		data.ScanPass = pass
+
 		local spotNear = hg_bot_spot_time:GetFloat()
 		local spotFar = hg_bot_spot_time_far:GetFloat()
 		local reacquire = hg_bot_reacquire_time:GetFloat()
@@ -1242,12 +1502,30 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 
 			local meter = spot[ply] or 0
 
-			if botPos:DistToSqr(GetCharacter(ply):GetPos()) > maxRangeSqr then
+			local ts = Snap(ply)
+			local pdx, pdy, pdz = ts.cx - bcx, ts.cy - bcy, ts.cz - bcz
+			local plyDistSqr = pdx * pdx + pdy * pdy + pdz * pdz
+
+			if plyDistSqr > maxRangeSqr then
 				if meter > 0 then spot[ply] = nil end
 				continue
 			end
 
-			local vis, info = hg.bots.CanSee(bot, ply)
+			-- Somebody the bot has not begun to notice, is not hunting and
+			-- was not hurt by is looked at at two body points instead of
+			-- three; and when he is far off as well, on every other pass,
+			-- with the time of both passes counted when he is. Up close,
+			-- half-noticed or known, nothing changes.
+			local dt = dt
+			local quick = meter == 0 and ply ~= mem.Target and not mem.Attackers[ply]
+
+			if quick and plyDistSqr > quickSqr then
+				if (pass + i) % 2 == 0 then continue end
+
+				dt = dt * 2
+			end
+
+			local vis, info = hg.bots.CanSee(bot, ply, quick)
 
 			if vis then
 				-- A target the bot is actively hunting (seen, or searched for
@@ -1260,31 +1538,34 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 				if now - lastContact < reacquire or (mem.Grudge and mem.Grudge[ply]) then
 					meter = 1
 				else
-					local rangeFrac = math.Clamp(info.dist / hg_bot_sight_range:GetFloat(), 0, 1)
+					local rangeFrac = math.Clamp(info.dist / sightRange, 0, 1)
 					local spotTime = Lerp(rangeFrac, spotNear, spotFar)
 					local rate = (spotTime <= 0) and math.huge or (1 / spotTime)
 
-					if not info.central then rate = rate * hg_bot_peripheral_speed:GetFloat() end
+					if not info.central then rate = rate * periSpeed end
 
-					rate = rate * (0.4 + 0.6 * info.frac) * (1 + alert) * GetTargetVisibilityMod(ply)
+					rate = rate * (0.4 + 0.6 * info.frac) * (1 + alert) * SnapMod(ts, ply)
 
-					if hg_bot_sight_attention:GetBool() then rate = rate * AttentionGain(bot, data, ply, info) end
+					if attention then rate = rate * AttentionGain(bot, data, ply, info) end
 
 					meter = math.min(meter + rate * dt, 1)
 				end
 
 				-- Danger check: anyone visible who shoots or aims at the bot
 				-- becomes a threat (trust mode too) and a priority target.
-				local wasHostile = hg.bots.IsHostile(ply, bot)
+				local hostile = hg.bots.IsHostile(ply, bot)
 				local danger = AssessDanger(bot, mem, ply, info, now, dt)
 
-				if not wasHostile and hg.bots.IsHostile(ply, bot) then
+				-- (Asked again only of somebody who was not hostile a moment
+				-- ago: the danger check is the one thing that can change it.)
+				if not hostile and hg.bots.IsHostile(ply, bot) then
+					hostile = true
 					meter = 1
 				end
 
 				spot[ply] = meter
 
-				if meter >= 1 and not hg.bots.IsHostile(ply, bot) then
+				if meter >= 1 and not hostile then
 					-- Trust mode: noticed, watched, not attacked.
 					if not glanceMeter or meter > glanceMeter then
 						glance, glanceMeter = ply, meter
@@ -1399,6 +1680,11 @@ local hg_bot_debug = GetConVar("hg_bot_debug") or CreateConVar("hg_bot_debug", "
 				nextScan[bot] = now + math.Rand(0, rate)
 				continue
 			end
+
+			-- Far from every player and with nobody to fight: half as often
+			-- (hg_bot_lod; the meters count the longer gap, so a far bot
+			-- notices just as soon, give or take one look).
+			if data.Far and not mem.Target then rate = rate * 2 end
 
 			nextScan[bot] = now + rate
 

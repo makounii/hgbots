@@ -345,10 +345,12 @@ local hg_bot_squad_pushers  = CreateConVar("hg_bot_squad_pushers",  "2",    {FCV
 		for other in pairs(hg.bots.List) do
 			local data = IsValid(other) and other ~= bot and other.Bot
 
-			if data and hg.bots.IsFriendly(bot, other) then
+			if data then
 				local theirs = data.Goal or data.MoveTarget
 
-				if theirs and theirs:DistToSqr(pos) < spreadSqr then
+				-- (Distance first: it is one subtraction, and whether the two
+				-- are on the same side is a good deal more than that.)
+				if theirs and theirs:DistToSqr(pos) < spreadSqr and hg.bots.IsFriendly(bot, other) then
 					local away = pos - theirs
 					away.z = 0
 

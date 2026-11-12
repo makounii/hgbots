@@ -39,7 +39,9 @@ local BLACKLIST_FILE = "hg_bots_kit_blacklist.json"
 		Matched by class AND by display name, so a renamed copy (a _tpik
 		variant, a fork's own version) is caught as well.
 	]]
-	local BANNED_CLASSES = { weapon_pluviska = true, weapon_fury13 = true, weapon_fury16 = true }
+	-- (The bow as well: random kits took it for a grenade, and a bot has
+	-- no idea how to draw one.)
+	local BANNED_CLASSES = { weapon_pluviska = true, weapon_fury13 = true, weapon_fury16 = true, weapon_hg_bow = true }
 	local BANNED_WORDS = { "pluv", "fury", "uber" }
 
 	local bannedCache = {}

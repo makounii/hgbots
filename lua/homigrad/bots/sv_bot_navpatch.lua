@@ -147,6 +147,10 @@ local UP = Vector(0, 0, 1)
 
 		if not x:IsConnected(y) then x:ConnectTo(y) end
 		if not y:IsConnected(x) then y:ConnectTo(x) end
+
+		-- The path search keeps its own copy of who borders whom
+		-- (sv_bot_navigation.lua's nav cache): it has to look again.
+		if hg.bots.NavCacheReset then hg.bots.NavCacheReset() end
 	end
 
 	--- Fill the gap between areas a and b. Returns the number of areas
